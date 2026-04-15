@@ -8,7 +8,8 @@ const SESSION_MAX_AGE_S = 8 * 60 * 60; // 8 hours
 // ─── HMAC helpers ─────────────────────────────────────────────────────────────
 
 function getSecret(): Uint8Array {
-  const secret = import.meta.env.PORTAL_SESSION_SECRET;
+  // Read from process.env at runtime — avoids Vite mangling $ signs in the build
+  const secret = process.env.PORTAL_SESSION_SECRET ?? import.meta.env.PORTAL_SESSION_SECRET;
   if (!secret) {
     throw new Error('PORTAL_SESSION_SECRET is not set. Set it before starting the portal.');
   }
@@ -80,11 +81,28 @@ export async function verifySession(cookies: AstroCookies): Promise<boolean> {
   return verifySessionToken(token);
 }
 
+/**
+ * Returns the raw Set-Cookie header string for the session token.
+ * Used directly in API route Response headers to ensure the cookie
+ * is always included regardless of Astro's context lifecycle.
+ */
+export async function buildSessionCookieHeader(): Promise<string> {
+  const token = await createSessionToken();
+  const insecure = (process.env.PORTAL_INSECURE_COOKIES ?? import.meta.env.PORTAL_INSECURE_COOKIES) === 'true';
+  const securePart = insecure ? '' : '; Secure';
+  return `${COOKIE_NAME}=${token}; HttpOnly${securePart}; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_S}`;
+}
+
+export function buildClearCookieHeader(): string {
+  return `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
 export async function setSessionCookie(cookies: AstroCookies): Promise<void> {
   const token = await createSessionToken();
+  const secureCookie = import.meta.env.PORTAL_INSECURE_COOKIES !== 'true';
   cookies.set(COOKIE_NAME, token, {
     httpOnly: true,
-    secure: true,
+    secure: secureCookie,
     sameSite: 'strict',
     path: '/',
     maxAge: SESSION_MAX_AGE_S,
@@ -98,7 +116,9 @@ export function clearSessionCookie(cookies: AstroCookies): void {
 // ─── Password verification ─────────────────────────────────────────────────────
 
 export async function verifyPassword(plaintext: string): Promise<boolean> {
-  const hash = import.meta.env.PORTAL_ADMIN_PASSWORD_HASH;
+  // Must read from process.env at runtime — Vite mangles $ signs (bcrypt hashes)
+  // when statically embedding import.meta.env values in the build.
+  const hash = process.env.PORTAL_ADMIN_PASSWORD_HASH ?? import.meta.env.PORTAL_ADMIN_PASSWORD_HASH;
   if (!hash) {
     logger.warn('PORTAL_ADMIN_PASSWORD_HASH is not set — login will always fail.');
     return false;

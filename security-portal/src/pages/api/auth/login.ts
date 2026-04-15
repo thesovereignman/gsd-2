@@ -1,8 +1,8 @@
 import type { APIRoute } from 'astro';
-import { verifyPassword, setSessionCookie } from '../../../lib/auth.js';
+import { verifyPassword, buildSessionCookieHeader } from '../../../lib/auth.js';
 import { logger } from '../../../lib/logger.js';
 
-export const POST: APIRoute = async ({ request, cookies, redirect }) => {
+export const POST: APIRoute = async ({ request }) => {
   let password: string;
 
   const ct = request.headers.get('content-type') ?? '';
@@ -34,14 +34,17 @@ export const POST: APIRoute = async ({ request, cookies, redirect }) => {
     });
   }
 
-  await setSessionCookie(cookies);
+  // Build cookie header explicitly to ensure it's included in the Response
+  const cookieHeader = await buildSessionCookieHeader();
   logger.info('successful login');
 
   return new Response(null, {
     status: 303,
-    headers: { Location: '/dashboard' },
+    headers: {
+      Location: '/dashboard',
+      'Set-Cookie': cookieHeader,
+    },
   });
 };
 
-// Disallow GET
 export const GET: APIRoute = () => new Response('Method Not Allowed', { status: 405 });
