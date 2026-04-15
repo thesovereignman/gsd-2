@@ -1,0 +1,94 @@
+---
+import Shield from '../shared/Shield.astro';
+import type { ShieldState } from '../../lib/shield.js';
+
+interface Props {
+  bdState: ShieldState;
+  frState: ShieldState;
+  currentPath: string;
+}
+
+const { bdState, frState, currentPath } = Astro.props;
+
+const navLinks = [
+  { href: '/dashboard', label: 'Dashboard' },
+  { href: '/alerts',    label: 'Alerts'    },
+  { href: '/settings',  label: 'Settings'  },
+];
+---
+
+<header class="bg-[#1B3A6B] text-white sticky top-0 z-50 shadow-md">
+  <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-6">
+
+    <!-- Wordmark -->
+    <a href="/dashboard" class="flex items-center gap-3 shrink-0">
+      <!-- Mini shield mark -->
+      <svg width="28" height="32" viewBox="0 0 100 112" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M50 4L6 22V56C6 80 24 100 50 108C76 100 94 80 94 56V22L50 4Z" fill="white" fill-opacity="0.15"/>
+        <path d="M50 4L6 22V56C6 80 24 100 50 108C76 100 94 80 94 56V22L50 4Z" stroke="white" stroke-width="4"/>
+        <rect x="40" y="55" width="20" height="15" rx="2" fill="white"/>
+        <path d="M44 55V50C44 46.7 46.7 44 50 44C53.3 44 56 46.7 56 50V55" stroke="white" stroke-width="3.5" fill="none"/>
+        <circle cx="50" cy="61" r="2" fill="#1B3A6B"/>
+        <rect x="49" y="61" width="2" height="4" rx="1" fill="#1B3A6B"/>
+      </svg>
+      <span class="font-bold text-base tracking-tight hidden sm:block">AutomateSecurity</span>
+    </a>
+
+    <!-- Nav links -->
+    <nav class="hidden md:flex items-center gap-1">
+      {navLinks.map(({ href, label }) => (
+        <a
+          href={href}
+          class={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            currentPath.startsWith(href)
+              ? 'bg-white/20 text-white'
+              : 'text-white/70 hover:text-white hover:bg-white/10'
+          }`}
+        >
+          {label}
+        </a>
+      ))}
+    </nav>
+
+    <!-- Right side: platform health + logout -->
+    <div class="flex items-center gap-4">
+      <!-- BestDefense status chip -->
+      <div class="hidden sm:flex items-center gap-1.5 bg-white/10 rounded-full px-3 py-1">
+        <Shield state={bdState} size={16} />
+        <span class="text-xs font-mono text-white/80">BD</span>
+      </div>
+
+      <!-- Fireraven status chip -->
+      <div class="hidden sm:flex items-center gap-1.5 bg-white/10 rounded-full px-3 py-1">
+        <Shield state={frState} size={16} />
+        <span class="text-xs font-mono text-white/80">FR</span>
+      </div>
+
+      <!-- Logout -->
+      <form method="POST" action="/api/auth/logout">
+        <button
+          type="submit"
+          class="text-xs font-mono text-white/60 hover:text-white transition-colors px-3 py-1.5 rounded border border-white/20 hover:border-white/40"
+        >
+          Sign Out
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Mobile nav -->
+  <div class="md:hidden border-t border-white/10 px-6 py-2 flex gap-2">
+    {navLinks.map(({ href, label }) => (
+      <a
+        href={href}
+        class={`flex-1 text-center py-2 rounded text-xs font-medium transition-colors ${
+          currentPath.startsWith(href)
+            ? 'bg-white/20 text-white'
+            : 'text-white/70'
+        }`}
+      >
+        {label}
+      </a>
+    ))}
+  </div>
+</header>

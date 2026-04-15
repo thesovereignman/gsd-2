@@ -1,0 +1,83 @@
+---
+import Shield from '../shared/Shield.astro';
+import StatusBadge from '../shared/StatusBadge.astro';
+import { shieldForSeverity } from '../../lib/shield.js';
+import type { Finding } from '../../lib/bestdefense.js';
+
+interface Props {
+  findings: Finding[];
+}
+
+const { findings } = Astro.props;
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const h = Math.floor(diff / 3_600_000);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d ago`;
+  if (h > 0) return `${h}h ago`;
+  return `<1h ago`;
+}
+
+const statusColors: Record<string, string> = {
+  open:      'text-[#F04438]',
+  in_review: 'text-[#F5C842]',
+  resolved:  'text-[#12B76A]',
+};
+---
+
+<div class="overflow-x-auto rounded-xl border border-[#D1D9E0]">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="bg-[#F5F8FA] border-b border-[#D1D9E0]">
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">ID</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">Title</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">Severity</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">Endpoint</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">CVE</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">Status</th>
+        <th class="text-left px-4 py-3 text-xs font-mono tracking-[0.1em] uppercase text-[#1B3A6B]">Found</th>
+      </tr>
+    </thead>
+    <tbody>
+      {findings.map((f, i) => (
+        <tr class={`border-b border-[#D1D9E0] hover:bg-[#EFF3F7] transition-colors ${i % 2 === 1 ? 'bg-[#F5F8FA]/50' : 'bg-white'}`}>
+          <td class="px-4 py-3 font-mono text-xs text-[#6B7280]">{f.id}</td>
+          <td class="px-4 py-3">
+            <div>
+              <p class="text-[#374151] font-medium leading-tight">{f.title}</p>
+              <p class="text-xs text-[#6B7280] mt-0.5 leading-tight line-clamp-1">{f.description}</p>
+            </div>
+          </td>
+          <td class="px-4 py-3">
+            <div class="flex items-center gap-2">
+              <Shield state={shieldForSeverity(f.severity)} size={24} />
+              <StatusBadge severity={f.severity} />
+            </div>
+          </td>
+          <td class="px-4 py-3 font-mono text-xs text-[#374151] max-w-[180px] truncate">{f.endpoint}</td>
+          <td class="px-4 py-3 font-mono text-xs">
+            {f.cve !== 'N/A'
+              ? <span class="text-[#F04438]">{f.cve}</span>
+              : <span class="text-[#6B7280]">—</span>
+            }
+          </td>
+          <td class="px-4 py-3">
+            <span class={`text-xs font-semibold font-mono uppercase ${statusColors[f.status] ?? 'text-[#6B7280]'}`}>
+              {f.status.replace('_', ' ')}
+            </span>
+          </td>
+          <td class="px-4 py-3 text-xs font-mono text-[#6B7280]">{relativeTime(f.discoveredAt)}</td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+
+  {findings.length === 0 && (
+    <div class="text-center py-16 text-[#6B7280]">
+      <p class="text-3xl mb-3">✓</p>
+      <p class="font-semibold text-[#12B76A]">No findings</p>
+      <p class="text-xs mt-1">All clear — no vulnerabilities detected</p>
+    </div>
+  )}
+</div>

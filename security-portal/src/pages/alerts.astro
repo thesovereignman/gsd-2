@@ -1,0 +1,173 @@
+---
+import Layout from '../components/layout/Layout.astro';
+import AlertFeedItem from '../components/shared/AlertFeedItem.astro';
+import { getFindings } from '../lib/bestdefense.js';
+import { getRecentEvents } from '../lib/fireraven.js';
+import { shieldForSeverity } from '../lib/shield.js';
+import type { ShieldState } from '../lib/shield.js';
+
+// Fetch both feeds in parallel
+const [findingsResult, eventsResult] = await Promise.allSettled([
+  getFindings({ limit: 50 }),
+  getRecentEvents({ limit: 50 }),
+]);
+
+const findings = findingsResult.status === 'fulfilled' ? findingsResult.value : [];
+const events   = eventsResult.status === 'fulfilled'   ? eventsResult.value   : [];
+
+// Normalise both into a unified shape
+interface FeedItem {
+  id: string;
+  source: 'BD' | 'FR';
+  state: ShieldState;
+  title: string;
+  detail: string;
+  meta: string;
+  timestamp: string;
+}
+
+const bdItems: FeedItem[] = findings.map((f) => ({
+  id: f.id,
+  source: 'BD',
+  state: shieldForSeverity(f.severity),
+  title: f.title,
+  detail: f.description,
+  meta: f.endpoint,
+  timestamp: f.discoveredAt,
+}));
+
+const frItems: FeedItem[] = events.map((e) => ({
+  id: e.id,
+  source: 'FR',
+  state: shieldForSeverity(
+    e.severity === 'pass' ? 'pass' :
+    e.severity === 'critical' ? 'critical' :
+    e.severity === 'high' ? 'high' :
+    e.severity === 'medium' ? 'medium' : 'low'
+  ),
+  title: e.message,
+  detail: e.detail,
+  meta: e.agent,
+  timestamp: e.timestamp,
+}));
+
+// Merge and sort chronologically (newest first)
+const allItems = [...bdItems, ...frItems].sort(
+  (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+);
+
+// Platform states for header
+const bdOpenCritical = findings.some((f) => f.severity === 'critical' && f.status !== 'resolved');
+const frHasBlocks    = events.some((e) => e.type === 'block');
+const bdState: ShieldState = bdOpenCritical ? 'critical' : findings.some(f => f.severity === 'high' && f.status !== 'resolved') ? 'warning' : 'secure';
+const frState: ShieldState = frHasBlocks ? 'warning' : 'secure';
+---
+
+<Layout title="Alerts" bdState={bdState} frState={frState}>
+
+  <!-- Section 1: Live Feed -->
+  <section class="w-full py-16 px-6 bg-page">
+    <div class="max-w-4xl mx-auto">
+      <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 1</p>
+      <hr class="border-[#1B3A6B] w-10 mb-6" />
+
+      <div class="flex items-end justify-between mb-6 flex-wrap gap-4">
+        <div>
+          <h1 class="text-2xl font-bold text-[#1B3A6B] tracking-tight">Live Security Feed</h1>
+          <p class="text-sm text-[#6B7280] mt-1">{allItems.length} events · auto-refreshes every 60s</p>
+        </div>
+        <!-- Meta refresh for no-JS auto-refresh -->
+        <meta http-equiv="refresh" content="60" />
+
+        <!-- Filter controls -->
+        <div class="flex items-center gap-2 flex-wrap">
+          <select id="filter-source" class="text-xs font-mono border border-[#D1D9E0] rounded-lg px-3 py-2 bg-white text-[#374151] focus:outline-none focus:border-[#1B3A6B]">
+            <option value="">All Sources</option>
+            <option value="BD">BestDefense</option>
+            <option value="FR">Fireraven</option>
+          </select>
+          <select id="filter-state" class="text-xs font-mono border border-[#D1D9E0] rounded-lg px-3 py-2 bg-white text-[#374151] focus:outline-none focus:border-[#1B3A6B]">
+            <option value="">All Severity</option>
+            <option value="critical">Critical</option>
+            <option value="warning">Warning</option>
+            <option value="secure">Pass / Secure</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Feed list -->
+      <div id="feed-list" class="rounded-xl border border-[#D1D9E0] overflow-hidden shadow-sm">
+        {allItems.length === 0
+          ? (
+            <div class="text-center py-16 bg-white text-[#6B7280]">
+              <p class="text-3xl mb-3">✓</p>
+              <p class="font-semibold text-[#12B76A]">No alerts</p>
+              <p class="text-xs mt-1">Everything looks clean</p>
+            </div>
+          )
+          : allItems.map((item) => (
+            <div
+              data-source={item.source}
+              data-state={item.state}
+              class="feed-item"
+            >
+              <AlertFeedItem
+                source={item.source}
+                state={item.state}
+                title={item.title}
+                detail={item.detail}
+                meta={item.meta}
+                timestamp={item.timestamp}
+              />
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <hr class="border-[#D1D9E0]" />
+
+  <!-- Section 2: Feed summary -->
+  <section class="w-full py-16 px-6 bg-white">
+    <div class="max-w-4xl mx-auto">
+      <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 2</p>
+      <hr class="border-[#1B3A6B] w-10 mb-6" />
+      <h2 class="text-xl font-bold text-[#1B3A6B] tracking-tight mb-6">Feed Summary</h2>
+
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {[
+          { label: 'Total Events',   value: allItems.length,                                       color: 'text-[#1B3A6B]' },
+          { label: 'BD Findings',    value: bdItems.length,                                         color: 'text-[#1B3A6B]' },
+          { label: 'FR Events',      value: frItems.length,                                         color: 'text-violet-700'   },
+          { label: 'Critical Alerts',value: allItems.filter(i => i.state === 'critical').length,    color: 'text-[#F04438]' },
+        ].map(({ label, value, color }) => (
+          <div class="bg-[#F5F8FA] border border-[#D1D9E0] rounded-xl p-5 text-center">
+            <p class={`text-3xl font-bold ${color}`}>{value}</p>
+            <p class="text-xs font-mono uppercase tracking-wide text-[#6B7280] mt-1">{label}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+</Layout>
+
+<script>
+  // Client-side filter
+  const sourceSelect = document.getElementById('filter-source') as HTMLSelectElement;
+  const stateSelect  = document.getElementById('filter-state')  as HTMLSelectElement;
+
+  function applyFilters() {
+    const source = sourceSelect.value;
+    const state  = stateSelect.value;
+    document.querySelectorAll<HTMLElement>('.feed-item').forEach((el) => {
+      const matchSource = !source || el.dataset.source === source;
+      const matchState  = !state  || el.dataset.state  === state;
+      el.style.display = matchSource && matchState ? '' : 'none';
+    });
+  }
+
+  sourceSelect?.addEventListener('change', applyFilters);
+  stateSelect?.addEventListener('change', applyFilters);
+</script>

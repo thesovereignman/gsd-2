@@ -1,0 +1,62 @@
+---
+import Shield from './Shield.astro';
+import type { ShieldState } from '../../lib/shield.js';
+
+interface Props {
+  state: ShieldState;
+  source: 'BD' | 'FR';
+  title: string;
+  detail?: string;
+  meta?: string;       // endpoint / agent
+  timestamp: string;
+}
+
+const { state, source, title, detail, meta, timestamp } = Astro.props;
+
+const sourcePill = source === 'BD'
+  ? { bg: 'bg-[#1B3A6B]', label: 'BD' }
+  : { bg: 'bg-violet-700', label: 'FR' };
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60_000);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d ago`;
+  if (h > 0) return `${h}h ago`;
+  if (m > 0) return `${m}m ago`;
+  return 'just now';
+}
+
+const borderColors: Record<ShieldState, string> = {
+  critical: 'border-l-[#F04438]',
+  warning:  'border-l-[#F5C842]',
+  secure:   'border-l-[#12B76A]',
+};
+---
+
+<div class={`flex items-start gap-4 border-b border-[#D1D9E0] border-l-4 ${borderColors[state]} px-5 py-4 hover:bg-[#EFF3F7] transition-colors bg-white`}>
+  <!-- Shield (24px) -->
+  <div class="shrink-0 pt-0.5">
+    <Shield state={state} size={24} />
+  </div>
+
+  <!-- Source pill + content -->
+  <div class="flex-1 min-w-0">
+    <div class="flex items-center gap-2 mb-1 flex-wrap">
+      <span class={`inline-block text-white text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${sourcePill.bg}`}>
+        {sourcePill.label}
+      </span>
+      <p class="text-sm font-medium text-[#374151] leading-snug">{title}</p>
+    </div>
+    {detail && (
+      <p class="text-xs text-[#6B7280] leading-snug line-clamp-2 mb-1">{detail}</p>
+    )}
+    {meta && (
+      <code class="text-[10px] font-mono text-[#6B7280] bg-[#EFF3F7] px-1.5 py-0.5 rounded">{meta}</code>
+    )}
+  </div>
+
+  <!-- Timestamp -->
+  <time class="shrink-0 text-[10px] font-mono text-[#6B7280] mt-1">{relativeTime(timestamp)}</time>
+</div>

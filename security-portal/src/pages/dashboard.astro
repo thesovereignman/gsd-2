@@ -1,0 +1,201 @@
+---
+import Layout from '../components/layout/Layout.astro';
+import Shield from '../components/shared/Shield.astro';
+import ComplianceGrid from '../components/bestdefense/ComplianceGrid.astro';
+import FindingsTable from '../components/bestdefense/FindingsTable.astro';
+import { getFindings, getComplianceStatus } from '../lib/bestdefense.js';
+import { getGuardStatus } from '../lib/fireraven.js';
+import { shieldForScore, shieldForSeverity } from '../lib/shield.js';
+
+// Fetch all data server-side in parallel
+const [findingsResult, complianceResult, frStatusResult] = await Promise.allSettled([
+  getFindings({ limit: 50 }),
+  getComplianceStatus(),
+  getGuardStatus(),
+]);
+
+const findings = findingsResult.status === 'fulfilled' ? findingsResult.value : [];
+const compliance = complianceResult.status === 'fulfilled' ? complianceResult.value : null;
+const frStatus = frStatusResult.status === 'fulfilled' ? frStatusResult.value : null;
+
+// Severity counts
+const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+for (const f of findings) {
+  if (f.status !== 'resolved' && f.severity in counts) {
+    counts[f.severity as keyof typeof counts]++;
+  }
+}
+const openFindings = findings.filter((f) => f.status !== 'resolved');
+
+// Overall posture: worst of any critical finding
+const overallState =
+  counts.critical > 0 ? 'critical' :
+  counts.high     > 0 ? 'warning'  : 'secure';
+
+// BestDefense state: based on critical/high open findings
+const bdState =
+  counts.critical > 0 ? 'critical' :
+  counts.high     > 0 ? 'warning'  : 'secure';
+
+// Fireraven state: based on guard status
+const frState = !frStatus ? 'warning'
+  : frStatus.totalBlocksToday > 0 ? 'warning'
+  : 'secure';
+
+const bdConfigured = !!import.meta.env.BESTDEFENSE_API_KEY;
+const frConfigured = !!import.meta.env.FIRERAVEN_API_KEY;
+---
+
+<Layout title="Dashboard" bdState={bdState} frState={frState}>
+
+  <!-- Section 1: Security Posture Hero -->
+  <section class="w-full py-16 px-6 bg-page">
+    <div class="max-w-7xl mx-auto">
+      <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 1</p>
+      <hr class="border-[#1B3A6B] w-10 mb-6" />
+      <div class="flex items-end justify-between mb-8 flex-wrap gap-4">
+        <h1 class="text-2xl font-bold text-[#1B3A6B] tracking-tight">Security Posture</h1>
+        {(!bdConfigured || !frConfigured) && (
+          <span class="inline-flex items-center gap-1.5 text-xs font-mono bg-[#FFFBEB] border border-[#F5C842]/50 text-[#92400E] px-3 py-1.5 rounded-full">
+            ⚠ Some data is from mock sources
+          </span>
+        )}
+      </div>
+
+      <!-- Three posture shields -->
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+        {[
+          { label: 'Overall', sublabel: 'Combined posture', state: overallState },
+          { label: 'BestDefense', sublabel: `${openFindings.length} open findings`, state: bdState },
+          { label: 'Fireraven', sublabel: frStatus ? `${frStatus.totalBlocksToday} blocks today` : 'Status unknown', state: frState },
+        ].map(({ label, sublabel, state }) => (
+          <div class="flex flex-col items-center gap-3 bg-white rounded-2xl border border-[#D1D9E0] shadow-sm py-10 px-6">
+            <Shield state={state} size={96} />
+            <div class="text-center">
+              <p class="font-bold text-[#1B3A6B] text-lg tracking-tight">{label}</p>
+              <p class="text-xs text-[#6B7280] font-mono mt-1">{sublabel}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <!-- Severity summary bar -->
+      <div class="mt-8 grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {([
+          { key: 'critical', label: 'Critical', color: 'text-[#F04438]', bg: 'bg-[#FEF2F2]', border: 'border-[#F04438]/30' },
+          { key: 'high',     label: 'High',     color: 'text-orange-500', bg: 'bg-orange-50', border: 'border-orange-200' },
+          { key: 'medium',   label: 'Medium',   color: 'text-[#F5C842]', bg: 'bg-[#FFFBEB]', border: 'border-[#F5C842]/40' },
+          { key: 'low',      label: 'Low',      color: 'text-blue-500',  bg: 'bg-blue-50',   border: 'border-blue-200'     },
+        ] as const).map(({ key, label, color, bg, border }) => (
+          <div class={`${bg} border ${border} rounded-xl p-4 text-center`}>
+            <p class={`text-3xl font-bold ${color}`}>{counts[key]}</p>
+            <p class="text-xs font-mono uppercase tracking-wide text-[#6B7280] mt-1">{label}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <hr class="border-[#D1D9E0]" />
+
+  <!-- Section 2: Compliance Status -->
+  {compliance && (
+    <section class="w-full py-16 px-6 bg-white">
+      <div class="max-w-7xl mx-auto">
+        <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 2</p>
+        <hr class="border-[#1B3A6B] w-10 mb-6" />
+        <h2 class="text-xl font-bold text-[#1B3A6B] tracking-tight mb-8">Compliance Status</h2>
+        <ComplianceGrid frameworks={compliance.frameworks} />
+        <p class="text-xs font-mono text-[#6B7280] mt-4">
+          Last updated {new Date(compliance.generatedAt).toLocaleString()}
+        </p>
+      </div>
+    </section>
+  )}
+
+  {compliance && <hr class="border-[#D1D9E0]" />}
+
+  <!-- Section 3: Vulnerability Findings -->
+  <section class={`w-full py-16 px-6 ${compliance ? 'bg-muted' : 'bg-white'}`}>
+    <div class="max-w-7xl mx-auto">
+      <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 3</p>
+      <hr class="border-[#1B3A6B] w-10 mb-6" />
+      <div class="flex items-center justify-between mb-6 flex-wrap gap-4">
+        <h2 class="text-xl font-bold text-[#1B3A6B] tracking-tight">Vulnerability Findings</h2>
+        <button
+          id="scan-trigger-btn"
+          type="button"
+          class="inline-flex items-center gap-2 bg-[#1B3A6B] hover:bg-[#2A5298] text-white text-sm font-medium px-5 py-2.5 rounded-lg transition-colors"
+        >
+          Run New Scan →
+        </button>
+      </div>
+      <FindingsTable findings={openFindings} />
+    </div>
+  </section>
+
+  <!-- Section 4: Fireraven AI Guard summary (if available) -->
+  {frStatus && (
+    <>
+      <hr class="border-[#D1D9E0]" />
+      <section class="w-full py-16 px-6 bg-white">
+        <div class="max-w-7xl mx-auto">
+          <p class="text-xs font-mono tracking-[0.2em] uppercase text-[#1B3A6B] mb-2">FIG. 4</p>
+          <hr class="border-[#1B3A6B] w-10 mb-6" />
+          <h2 class="text-xl font-bold text-[#1B3A6B] tracking-tight mb-8">Fireraven AI Guard</h2>
+
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            {[
+              { label: 'Active Agents',        value: String(frStatus.activeAgents),        color: 'text-[#1B3A6B]' },
+              { label: 'Blocks Today',          value: String(frStatus.totalBlocksToday),    color: frStatus.totalBlocksToday > 0 ? 'text-[#F04438]' : 'text-[#12B76A]' },
+              { label: 'Scans This Week',       value: String(frStatus.totalScansThisWeek),  color: 'text-[#1B3A6B]' },
+              { label: 'Credits Remaining',     value: frStatus.creditsRemaining.toLocaleString(), color: 'text-[#12B76A]' },
+            ].map(({ label, value, color }) => (
+              <div class="bg-[#F5F8FA] border border-[#D1D9E0] rounded-xl p-5 text-center">
+                <p class={`text-3xl font-bold ${color}`}>{value}</p>
+                <p class="text-xs font-mono uppercase tracking-wide text-[#6B7280] mt-1">{label}</p>
+              </div>
+            ))}
+          </div>
+
+          <p class="text-xs font-mono text-[#6B7280] mt-4">
+            Plan: {frStatus.plan} · Updated {new Date(frStatus.updatedAt).toLocaleString()}
+          </p>
+        </div>
+      </section>
+    </>
+  )}
+</Layout>
+
+<script>
+  // Scan trigger with CSRF origin check (handled server-side too)
+  const btn = document.getElementById('scan-trigger-btn');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      const target = prompt('Enter target URL to scan (e.g. https://app.example.com):');
+      if (!target) return;
+
+      btn.textContent = 'Queuing scan…';
+      (btn as HTMLButtonElement).disabled = true;
+
+      try {
+        const res = await fetch('/api/bestdefense/scans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert(`Scan queued: ${data.id}\nStatus: ${data.status}`);
+        } else {
+          alert(`Error: ${data.error ?? 'Unknown error'}`);
+        }
+      } catch {
+        alert('Failed to trigger scan — check your connection.');
+      }
+
+      btn.textContent = 'Run New Scan →';
+      (btn as HTMLButtonElement).disabled = false;
+    });
+  }
+</script>
