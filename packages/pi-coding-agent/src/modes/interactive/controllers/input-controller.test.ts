@@ -17,6 +17,7 @@ function createHost(options: HostOptions = {}) {
 	const prompted: string[] = [];
 	const errors: string[] = [];
 	const warnings: string[] = [];
+	const tips: string[] = [];
 	const history: string[] = [];
 	const knownSlashCommands = new Set(options.knownSlashCommands ?? []);
 	let editorText = "";
@@ -60,6 +61,9 @@ function createHost(options: HostOptions = {}) {
 		showError(message: string) {
 			errors.push(message);
 		},
+		showTip(message: string) {
+			tips.push(message);
+		},
 		updateEditorBorderColor() {},
 		isExtensionCommand() {
 			return false;
@@ -70,6 +74,15 @@ function createHost(options: HostOptions = {}) {
 		queueCompactionMessage() {},
 		updatePendingMessagesDisplay() {},
 		flushPendingBashComponents() {},
+		contextualTips: {
+			recordBashIncluded() {},
+			evaluate() {
+				return undefined;
+			},
+		},
+		getContextPercent() {
+			return undefined;
+		},
 	};
 
 	setupEditorSubmitHandler(host as any);
@@ -79,6 +92,7 @@ function createHost(options: HostOptions = {}) {
 		prompted,
 		errors,
 		warnings,
+		tips,
 		history,
 		getEditorText: () => editorText,
 		getSettingsOpened: () => settingsOpened,
@@ -153,4 +167,31 @@ test("input-controller: truly unknown slash commands stop before session.prompt"
 		["Unknown command: /definitely-not-a-command. Use slash autocomplete to see available commands."],
 	);
 	assert.equal(getEditorText(), "", "unknown slash commands should clear the editor after showing the error");
+});
+
+test("input-controller: absolute file paths are not treated as slash commands (#3478)", async () => {
+	const { host, prompted, errors } = createHost();
+
+	await host.defaultEditor.onSubmit("/Users/name/Desktop/screenshot.png");
+
+	assert.deepEqual(errors, [], "file paths should not trigger unknown command error");
+	assert.deepEqual(prompted, ["/Users/name/Desktop/screenshot.png"], "file paths should be sent as plain input");
+});
+
+test("input-controller: Linux absolute paths are not treated as slash commands (#3478)", async () => {
+	const { host, prompted, errors } = createHost();
+
+	await host.defaultEditor.onSubmit("/home/user/documents/file.txt");
+
+	assert.deepEqual(errors, [], "Linux paths should not trigger unknown command error");
+	assert.deepEqual(prompted, ["/home/user/documents/file.txt"], "Linux paths should be sent as plain input");
+});
+
+test("input-controller: /tmp paths are not treated as slash commands (#3478)", async () => {
+	const { host, prompted, errors } = createHost();
+
+	await host.defaultEditor.onSubmit("/tmp/some-file.log");
+
+	assert.deepEqual(errors, []);
+	assert.deepEqual(prompted, ["/tmp/some-file.log"]);
 });

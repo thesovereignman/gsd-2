@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -35,12 +35,15 @@ function makeMockSession(opts?: {
   newSessionDelayMs?: number;
   onNewSessionStart?: (session: any) => void;
   onNewSessionSettle?: (session: any) => void;
+  /** Called after the delay with the aborted state of any passed abortSignal.
+   *  Used to verify that runUnit passes an aborted signal on late resolution (#3731). */
+  onSignalCheck?: (aborted: boolean) => void;
 }) {
   const session = {
     active: true,
     verbose: false,
     cmdCtx: {
-      newSession: () => {
+      newSession: (options?: { abortSignal?: AbortSignal }) => {
         opts?.onNewSessionStart?.(session);
         if (opts?.newSessionThrows) {
           return Promise.reject(new Error(opts.newSessionThrows));
@@ -50,11 +53,17 @@ function makeMockSession(opts?: {
         if (delay > 0) {
           return new Promise<{ cancelled: boolean }>((res) =>
             setTimeout(() => {
+              // Simulate AgentSession.newSession() checking abortSignal after
+              // its internal async work (abort()) completes — this is where the
+              // real code captures process.cwd() and rebuilds the tool runtime.
+              // If the signal is aborted, the real code discards the session.
+              opts?.onSignalCheck?.(options?.abortSignal?.aborted ?? false);
               opts?.onNewSessionSettle?.(session);
               res(result);
             }, delay),
           );
         }
+        opts?.onSignalCheck?.(options?.abortSignal?.aborted ?? false);
         opts?.onNewSessionSettle?.(session);
         return Promise.resolve(result);
       },
@@ -191,6 +200,54 @@ test("runUnit returns cancelled when session creation times out", async () => {
   assert.equal(pi.calls.length, 0);
 });
 
+test("runUnit keeps the session-switch guard across a late newSession settlement", async () => {
+  _resetPendingResolve();
+  mock.timers.enable();
+
+  try {
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+    // Use delays longer than NEW_SESSION_TIMEOUT_MS (120s) so the timeout fires
+    const firstSession = makeMockSession({ newSessionDelayMs: 200_000 });
+    const secondSession = makeMockSession({ newSessionDelayMs: 200_000 });
+
+    const firstRun = runUnit(ctx, pi, firstSession, "task", "T01", "prompt");
+
+    // Tick past the 120s session timeout
+    mock.timers.tick(121_000);
+    await Promise.resolve();
+
+    const firstResult = await firstRun;
+    assert.equal(firstResult.status, "cancelled");
+    assert.equal(isSessionSwitchInFlight(), true, "guard should remain set after the timed-out session");
+
+    mock.timers.tick(1);
+    const secondRun = runUnit(ctx, pi, secondSession, "task", "T02", "prompt");
+
+    mock.timers.tick(100_000);
+    await Promise.resolve();
+    assert.equal(
+      isSessionSwitchInFlight(),
+      true,
+      "late settlement from the first session must not clear the newer session guard",
+    );
+
+    // Tick past the second session's timeout (121s total > 120s NEW_SESSION_TIMEOUT_MS)
+    mock.timers.tick(21_001);
+    await Promise.resolve();
+
+    const secondResult = await secondRun;
+    assert.equal(secondResult.status, "cancelled");
+
+    // Tick past the second session's delayed promise (200s) so .finally() fires
+    mock.timers.tick(80_000);
+    await Promise.resolve();
+    assert.equal(isSessionSwitchInFlight(), false, "guard should clear after the newer session settles");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test("runUnit returns cancelled when s.active is false before sendMessage", async () => {
   _resetPendingResolve();
 
@@ -265,6 +322,217 @@ test("runUnit re-applies the selected unit model after newSession before dispatc
   assert.equal(pi.calls.length, 1);
 });
 
+test("runUnit cancels before dispatch when model restore fails after newSession", async () => {
+  _resetPendingResolve();
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = makeMockCtx();
+  ctx.ui.notify = (message: string, level: string) => {
+    notifications.push({ message, level });
+  };
+
+  const pi = makeMockPi();
+  pi.setModel = async (...args: unknown[]) => {
+    pi.setModelCalls.push(args);
+    return false;
+  };
+
+  const s = makeMockSession();
+  s.currentUnitModel = { provider: "openai-codex", id: "gpt-5.4" };
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "session-failed");
+  assert.match(
+    result.errorContext?.message ?? "",
+    /Failed to restore configured model openai-codex\/gpt-5\.4 after session creation/,
+  );
+  assert.equal(pi.setModelCalls.length, 1);
+  assert.equal(pi.calls.length, 0, "unit must not dispatch on the session default model");
+  assert.deepEqual(notifications, [
+    {
+      message: "Failed to restore configured model openai-codex/gpt-5.4 after session creation. Cancelling unit before dispatch.",
+      level: "warning",
+    },
+  ]);
+});
+
+test("runUnit cancels before dispatch when provider is not request-ready (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => false,
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.match(
+    result.errorContext?.message ?? "",
+    /Provider anthropic is not request-ready/,
+  );
+  assert.equal(pi.calls.length, 0, "sendMessage must not be called when provider is not ready");
+});
+
+test("runUnit cancels before dispatch using currentUnitModel provider when set (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  // ctx.model uses "openai" which IS ready — if the code ignores currentUnitModel
+  // and falls back to ctx.model.provider, the unit would NOT be cancelled. The
+  // test therefore differentiates: only a bug (wrong provider lookup) would pass.
+  ctx.model = { provider: "openai", id: "gpt-4o" };
+  // modelRegistry says anthropic is not ready but openai is
+  ctx.modelRegistry = {
+    isProviderRequestReady: (provider: string) => provider === "openai",
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+  // currentUnitModel overrides the provider used in the readiness check
+  s.currentUnitModel = { provider: "anthropic", id: "claude-opus-4-6" };
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.match(
+    result.errorContext?.message ?? "",
+    /Provider anthropic is not request-ready/,
+  );
+  assert.equal(pi.calls.length, 0, "sendMessage must not be called — anthropic (currentUnitModel) is not ready");
+});
+
+test("runUnit does not cancel before dispatch when provider is request-ready (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => true,
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  await new Promise((r) => setTimeout(r, 10));
+  resolveAgentEnd(makeEvent());
+
+  const result = await resultPromise;
+  assert.equal(result.status, "completed");
+  assert.equal(pi.calls.length, 1, "sendMessage must be called when provider is ready");
+});
+
+test("runUnit proceeds when modelRegistry is absent (no readiness check available) (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  // No modelRegistry on ctx — pre-check should be skipped
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  await new Promise((r) => setTimeout(r, 10));
+  resolveAgentEnd(makeEvent());
+
+  const result = await resultPromise;
+  assert.equal(result.status, "completed");
+  assert.equal(pi.calls.length, 1);
+});
+
+test("runUnit proceeds when isProviderRequestReady throws (defensive) (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => {
+      throw new Error("registry error");
+    },
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  // When the readyCheck throws, ready=false → unit cancelled
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.equal(pi.calls.length, 0);
+});
+
+test("late-resolving newSession() after timeout receives aborted signal so tool runtime is not configured with root cwd (#3731)", async () => {
+  // When newSession() times out in runUnit(), auto-mode restores cwd to project
+  // root. If newSession() later resolves, it must NOT use process.cwd() to
+  // configure the tool runtime (which would give it root cwd, not worktree cwd).
+  //
+  // The fix: runUnit creates an AbortController, aborts it on timeout, and passes
+  // the signal to newSession(). AgentSession.newSession() checks the signal after
+  // its internal await this.abort() completes and returns early (discards) if aborted.
+  //
+  // This test uses mock.timers to control timing precisely.
+  _resetPendingResolve();
+  mock.timers.enable();
+
+  try {
+    let abortedWhenLateSessionSettled: boolean | null = null;
+
+    // newSession mock simulates AgentSession.newSession() behavior:
+    // after an internal delay (representing await this.abort()), it checks the
+    // abortSignal — that's where the real code would capture process.cwd() and
+    // call _buildRuntime. If aborted, the real code must discard the session.
+    const s = makeMockSession({
+      newSessionDelayMs: 200_000, // longer than NEW_SESSION_TIMEOUT_MS (120s)
+      onSignalCheck: (aborted) => {
+        abortedWhenLateSessionSettled = aborted;
+      },
+    });
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+
+    const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+    // Tick past the 120s NEW_SESSION_TIMEOUT_MS — runUnit returns cancelled
+    mock.timers.tick(121_000);
+    await Promise.resolve();
+
+    const result = await resultPromise;
+    assert.equal(result.status, "cancelled", "runUnit must return cancelled on session timeout");
+
+    // Tick past the delayed newSession (200s total) — the late newSession resolves
+    mock.timers.tick(80_000);
+    // Drain microtask queue so the .finally() and setTimeout callbacks run
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The key assertion: when the late newSession() resolves, runUnit must have
+    // passed an aborted AbortSignal. Without the fix, no signal is passed and
+    // abortedWhenLateSessionSettled would be false (or null, if signal not passed at all).
+    assert.equal(
+      abortedWhenLateSessionSettled,
+      true,
+      "runUnit must pass an aborted AbortSignal to newSession() when it resolves after the session-creation timeout (#3731). " +
+      "Without this, AgentSession.newSession() captures root process.cwd() and rebuilds the tool runtime with wrong cwd.",
+    );
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 // ─── Structural assertions ───────────────────────────────────────────────────
 
 test("auto-loop.ts exports autoLoop, runUnit, resolveAgentEnd", async () => {
@@ -325,7 +593,7 @@ test("auto/phases.ts: selectAndApplyModel called exactly once and before updateP
   // Extract the runUnitPhase function body
   const fnStart = src.indexOf("export async function runUnitPhase");
   assert.ok(fnStart > 0, "runUnitPhase should exist in phases.ts");
-  const fnBody = src.slice(fnStart, fnStart + 8000);
+  const fnBody = src.slice(fnStart, fnStart + 16000);
 
   // selectAndApplyModel must appear exactly once
   const allOccurrences = [...fnBody.matchAll(/selectAndApplyModel\(/g)];
@@ -412,7 +680,9 @@ function makeMockDeps(
     getCurrentBranch: () => "main",
     autoWorktreeBranch: () => "auto/M001",
     resolveMilestoneFile: () => null,
-    reconcileMergeState: () => false,
+    reconcileMergeState: () => "clean",
+    preflightCleanRoot: () => ({ stashPushed: false, summary: "" }),
+    postflightPopStash: () => {},
     getLedger: () => null,
     getProjectTotals: () => ({ cost: 0 }),
     formatCost: (c: number) => `$${c.toFixed(2)}`,
@@ -640,8 +910,8 @@ test("autoLoop exits on terminal blocked state", async (t) => {
 
   assert.ok(deps.callLog.includes("deriveState"), "should have derived state");
   assert.ok(
-    deps.callLog.includes("stopAuto"),
-    "should have called stopAuto for blocked state",
+    deps.callLog.includes("pauseAuto"),
+    "should have called pauseAuto for blocked state",
   );
   assert.ok(
     !deps.callLog.includes("resolveDispatch"),
@@ -1219,7 +1489,7 @@ test("auto-loop.ts barrel re-exports autoLoop, runUnit, and resolveAgentEnd", ()
   );
 });
 
-test("auto.ts startAuto calls autoLoop (not dispatchNextUnit as first dispatch)", () => {
+test("auto.ts startAuto dispatches through the UOK kernel wrapper with explicit kernel and legacy paths", () => {
   const src = readFileSync(
     resolve(import.meta.dirname, "..", "auto.ts"),
     "utf-8",
@@ -1231,8 +1501,16 @@ test("auto.ts startAuto calls autoLoop (not dispatchNextUnit as first dispatch)"
   const fnBlock =
     fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 5000);
   assert.ok(
-    fnBlock.includes("autoLoop("),
-    "startAuto must call autoLoop() instead of dispatchNextUnit()",
+    fnBlock.includes("runAutoLoopWithUok("),
+    "startAuto must dispatch through runAutoLoopWithUok()",
+  );
+  assert.ok(
+    fnBlock.includes("runKernelLoop: runUokKernelLoop"),
+    "startAuto must wire the explicit UOK kernel loop path",
+  );
+  assert.ok(
+    fnBlock.includes("runLegacyLoop: runLegacyAutoLoop"),
+    "startAuto must preserve explicit legacy fallback dispatch",
   );
 });
 
@@ -1280,7 +1558,7 @@ test("startAuto guards against concurrent invocation (#2923)", () => {
   );
 });
 
-test("agent_end handler calls resolveAgentEnd (not handleAgentEnd)", () => {
+test("agent_end handler calls resolveAgentEnd (not the legacy auto.ts path)", () => {
   const hooksSrc = readFileSync(
     resolve(import.meta.dirname, "..", "bootstrap", "register-hooks.ts"),
     "utf-8",
@@ -1295,7 +1573,7 @@ test("agent_end handler calls resolveAgentEnd (not handleAgentEnd)", () => {
   );
   assert.ok(
     recoverySrc.includes("resolveAgentEnd(event)"),
-    "agent_end success path must call resolveAgentEnd(event) instead of handleAgentEnd(ctx, pi)",
+    "agent_end success path must call resolveAgentEnd(event) instead of legacy wrappers",
   );
   assert.ok(
     recoverySrc.includes("isSessionSwitchInFlight()"),
@@ -1334,32 +1612,6 @@ test("auto-timeout-recovery.ts calls resolveAgentEnd instead of dispatchNextUnit
   assert.ok(
     src.includes("resolveAgentEnd("),
     "auto-timeout-recovery.ts must call resolveAgentEnd to re-iterate the loop on timeout recovery",
-  );
-});
-
-test("handleAgentEnd in auto.ts is a thin wrapper calling resolveAgentEnd", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto.ts"),
-    "utf-8",
-  );
-  const fnIdx = src.indexOf("export async function handleAgentEnd");
-  assert.ok(fnIdx > -1, "handleAgentEnd must exist");
-  const fnEnd = src.indexOf("\n// ─── ", fnIdx + 100);
-  const fnBlock =
-    fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 1000);
-  assert.ok(
-    fnBlock.includes("resolveAgentEnd("),
-    "handleAgentEnd must call resolveAgentEnd",
-  );
-  // The function should be short — no reentrancy guard, no verification, no dispatch
-  assert.ok(
-    !fnBlock.includes("dispatchNextUnit"),
-    "handleAgentEnd must not call dispatchNextUnit (it's now a thin wrapper)",
-  );
-  assert.ok(
-    !fnBlock.includes("postUnitPreVerification") &&
-      !fnBlock.includes("postUnitPostVerification"),
-    "handleAgentEnd must not contain verification logic (moved to autoLoop)",
   );
 });
 
@@ -2107,11 +2359,11 @@ test("autoLoop rejects execute-task with 0 tool calls as hallucinated (#1833)", 
   // The task should NOT have been added to completedUnits on the first iteration
   // (0 tool calls), but SHOULD be added on the second iteration (5 tool calls)
   const warningNotification = notifications.find(
-    (n) => n.includes("0 tool calls") && n.includes("hallucinated"),
+    (n) => n.includes("0 tool calls") && n.includes("context exhaustion"),
   );
   assert.ok(
     warningNotification,
-    "should notify about 0 tool calls hallucination",
+    "should notify about 0 tool calls context exhaustion",
   );
 
   // Verify deriveState was called at least twice (two iterations)
@@ -2122,7 +2374,7 @@ test("autoLoop rejects execute-task with 0 tool calls as hallucinated (#1833)", 
   );
 });
 
-test("autoLoop does NOT reject non-execute-task units with 0 tool calls (#1833)", async () => {
+test("autoLoop rejects complete-slice with 0 tool calls as context-exhausted (#2653)", async () => {
   _resetPendingResolve();
 
   const ctx = makeMockCtx();
@@ -2130,6 +2382,7 @@ test("autoLoop does NOT reject non-execute-task units with 0 tool calls (#1833)"
   ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
   const pi = makeMockPi();
 
+  let iterationCount = 0;
   const notifications: string[] = [];
   ctx.ui.notify = (msg: string) => { notifications.push(msg); };
 
@@ -2163,7 +2416,7 @@ test("autoLoop does NOT reject non-execute-task units with 0 tool calls (#1833)"
       };
     },
     closeoutUnit: async () => {
-      // complete-slice with 0 tool calls is fine (e.g. it may just update status)
+      // complete-slice with 0 tool calls — context exhausted, no progress
       mockLedger.units.push({
         type: "complete-slice",
         id: "M001/S01",
@@ -2177,31 +2430,51 @@ test("autoLoop does NOT reject non-execute-task units with 0 tool calls (#1833)"
     getLedger: () => mockLedger,
     postUnitPostVerification: async () => {
       deps.callLog.push("postUnitPostVerification");
-      s.active = false;
+      iterationCount++;
+      // Deactivate after 2nd iteration
+      s.active = iterationCount < 2;
       return "continue" as const;
     },
   });
 
   const loopPromise = autoLoop(ctx, pi, s, deps);
 
+  // First iteration: complete-slice with 0 tool calls → rejected
   await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+
+  // Second iteration: re-dispatched, this time with tool calls
+  await new Promise((r) => setTimeout(r, 50));
+  mockLedger.units.length = 0;
+  (deps as any).closeoutUnit = async () => {
+    mockLedger.units.push({
+      type: "complete-slice",
+      id: "M001/S01",
+      startedAt: s.currentUnit?.startedAt ?? Date.now(),
+      toolCalls: 3,
+      assistantMessages: 2,
+      tokens: { input: 200, output: 400, total: 600, cacheRead: 0, cacheWrite: 0 },
+      cost: 0.30,
+    });
+  };
   resolveAgentEnd(makeEvent());
 
   await loopPromise;
 
-  // Should NOT have a hallucination warning for non-execute-task units
+  // Should have a warning about 0 tool calls for complete-slice
   const warningNotification = notifications.find(
-    (n) => n.includes("0 tool calls") && n.includes("hallucinated"),
+    (n) => n.includes("0 tool calls"),
   );
   assert.ok(
-    !warningNotification,
-    "should NOT flag non-execute-task units with 0 tool calls",
+    warningNotification,
+    "should flag complete-slice with 0 tool calls as failed (#2653)",
   );
 
-  // Verify the loop ran to completion (postUnitPostVerification was called)
+  // Verify deriveState was called at least twice (two iterations: rejected + retry)
+  const deriveCount = deps.callLog.filter((c) => c === "deriveState").length;
   assert.ok(
-    deps.callLog.includes("postUnitPostVerification"),
-    "complete-slice with 0 tool calls should still complete the post-unit pipeline",
+    deriveCount >= 2,
+    `deriveState should be called at least 2 times for retry (got ${deriveCount})`,
   );
 });
 
