@@ -1,0 +1,36 @@
+---
+interface Props {
+  size?: 16 | 24 | 48 | 96;
+  class?: string;
+}
+const { size = 24, class: cls = '' } = Astro.props;
+---
+<!--
+  GREEN shield: SECURE / PASS / Clean
+  Design: navy outline, ice-white inner ring, emerald-green fill, white circle with navy locked-padlock + checkmark
+-->
+<svg
+  width={size}
+  height={size}
+  viewBox="0 0 100 112"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  class={cls}
+  aria-label="Secure — no threats detected"
+  role="img"
+>
+  <!-- Outer navy border -->
+  <path d="M50 4L6 22V56C6 80 24 100 50 108C76 100 94 80 94 56V22L50 4Z" fill="#1B3A6B"/>
+  <!-- Ice-white inner ring -->
+  <path d="M50 10L12 27V56C12 77 28 95 50 102C72 95 88 77 88 56V27L50 10Z" fill="#E8F1F8"/>
+  <!-- Green fill -->
+  <path d="M50 17L18 32V56C18 74 32 90 50 97C68 90 82 74 82 56V32L50 17Z" fill="#12B76A"/>
+  <!-- White circle -->
+  <circle cx="50" cy="60" r="18" fill="white"/>
+  <!-- Navy closed padlock body -->
+  <rect x="40" y="60" width="20" height="14" rx="2.5" fill="#1B3A6B"/>
+  <!-- Closed shackle (full arc) -->
+  <path d="M44 60V55C44 51.7 46.7 49 50 49C53.3 49 56 51.7 56 55V60" stroke="#1B3A6B" stroke-width="3.5" stroke-linecap="round" fill="none"/>
+  <!-- White checkmark on lock body -->
+  <path d="M45.5 67L49 70.5L55 64" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

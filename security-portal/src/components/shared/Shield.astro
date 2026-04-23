@@ -1,0 +1,16 @@
+---
+import ShieldCritical from './ShieldCritical.astro';
+import ShieldWarning from './ShieldWarning.astro';
+import ShieldSecure from './ShieldSecure.astro';
+import type { ShieldState } from '../../lib/shield.js';
+
+interface Props {
+  state: ShieldState;
+  size?: 16 | 24 | 48 | 96;
+  class?: string;
+}
+const { state, size = 24, class: cls = '' } = Astro.props;
+---
+{state === 'critical' && <ShieldCritical size={size} class={cls} />}
+{state === 'warning'  && <ShieldWarning  size={size} class={cls} />}
+{state === 'secure'   && <ShieldSecure   size={size} class={cls} />}

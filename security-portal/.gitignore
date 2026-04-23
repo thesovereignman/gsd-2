@@ -1,0 +1,18 @@
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+
+# Astro build output
+dist/
+.astro/
+
+# Vercel build output
+.vercel/output/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

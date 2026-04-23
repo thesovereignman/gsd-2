@@ -1,0 +1,32 @@
+---
+import Shield from '../shared/Shield.astro';
+import { shieldForScore } from '../../lib/shield.js';
+import type { ComplianceFramework } from '../../lib/bestdefense.js';
+
+interface Props {
+  frameworks: ComplianceFramework[];
+}
+
+const { frameworks } = Astro.props;
+---
+
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+  {frameworks.map((fw) => {
+    const state = shieldForScore(fw.score);
+    return (
+      <div class="bg-white rounded-xl border border-[#D1D9E0] shadow-sm p-5 flex flex-col items-center text-center gap-3">
+        <Shield state={state} size={48} />
+        <div>
+          <p class="text-xs font-mono font-semibold text-[#1B3A6B] tracking-wide uppercase">{fw.name}</p>
+          <p class={`text-2xl font-bold mt-1 ${
+            state === 'secure'   ? 'text-[#12B76A]' :
+            state === 'warning'  ? 'text-[#F5C842]' : 'text-[#F04438]'
+          }`}>{fw.score}%</p>
+          <p class="text-[10px] text-[#6B7280] mt-1 font-mono">
+            {fw.passCount}/{fw.totalControls} controls
+          </p>
+        </div>
+      </div>
+    );
+  })}
+</div>

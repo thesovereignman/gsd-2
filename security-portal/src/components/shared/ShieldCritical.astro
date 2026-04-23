@@ -1,0 +1,32 @@
+---
+interface Props {
+  size?: 16 | 24 | 48 | 96;
+  class?: string;
+}
+const { size = 24, class: cls = '' } = Astro.props;
+---
+<!--
+  RED shield: CRITICAL / FAIL / Threat detected
+  Design: navy outline, ice-white inner ring, coral-red fill, white circle with navy X
+-->
+<svg
+  width={size}
+  height={size}
+  viewBox="0 0 100 112"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  class={cls}
+  aria-label="Critical threat detected"
+  role="img"
+>
+  <!-- Outer navy border -->
+  <path d="M50 4L6 22V56C6 80 24 100 50 108C76 100 94 80 94 56V22L50 4Z" fill="#1B3A6B"/>
+  <!-- Ice-white inner ring -->
+  <path d="M50 10L12 27V56C12 77 28 95 50 102C72 95 88 77 88 56V27L50 10Z" fill="#E8F1F8"/>
+  <!-- Red fill -->
+  <path d="M50 17L18 32V56C18 74 32 90 50 97C68 90 82 74 82 56V32L50 17Z" fill="#F04438"/>
+  <!-- White circle -->
+  <circle cx="50" cy="60" r="18" fill="white"/>
+  <!-- Navy X icon -->
+  <path d="M42 52L58 68M58 52L42 68" stroke="#1B3A6B" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

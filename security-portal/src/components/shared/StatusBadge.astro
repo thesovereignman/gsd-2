@@ -1,0 +1,27 @@
+---
+type Severity = 'critical' | 'high' | 'medium' | 'low' | 'pass' | 'fail' | 'info' | 'mock';
+
+interface Props {
+  severity: Severity;
+  label?: string;
+}
+
+const { severity, label } = Astro.props;
+
+const CONFIG: Record<Severity, { bg: string; text: string; defaultLabel: string }> = {
+  critical: { bg: 'bg-[#F04438]',      text: 'text-white',       defaultLabel: 'CRITICAL' },
+  high:     { bg: 'bg-orange-500',      text: 'text-white',       defaultLabel: 'HIGH'     },
+  medium:   { bg: 'bg-[#F5C842]',      text: 'text-[#1B3A6B]',   defaultLabel: 'MEDIUM'   },
+  low:      { bg: 'bg-blue-500',        text: 'text-white',       defaultLabel: 'LOW'      },
+  pass:     { bg: 'bg-[#12B76A]',      text: 'text-white',       defaultLabel: 'PASS'     },
+  fail:     { bg: 'bg-[#F04438]',      text: 'text-white',       defaultLabel: 'FAIL'     },
+  info:     { bg: 'bg-slate-500',       text: 'text-white',       defaultLabel: 'INFO'     },
+  mock:     { bg: 'bg-slate-200',       text: 'text-slate-600',   defaultLabel: 'MOCK DATA'},
+};
+
+const { bg, text, defaultLabel } = CONFIG[severity];
+const displayLabel = label ?? defaultLabel;
+---
+<span class={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] font-mono font-semibold tracking-[0.08em] uppercase ${bg} ${text}`}>
+  {displayLabel}
+</span>

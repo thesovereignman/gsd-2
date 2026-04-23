@@ -1,0 +1,87 @@
+---
+import Shield from './Shield.astro';
+import type { ShieldState } from '../../lib/shield.js';
+
+interface Props {
+  platform: 'BestDefense.io' | 'Fireraven.ai';
+  slug: 'bestdefense' | 'fireraven';
+  configured: boolean;
+  state: ShieldState;
+}
+
+const { platform, slug, configured, state } = Astro.props;
+
+const stateLabel = configured
+  ? (state === 'secure' ? 'CONNECTED' : state === 'warning' ? 'DEGRADED' : 'ERROR')
+  : 'MOCK DATA';
+---
+
+<div class="bg-white rounded-xl border border-[#D1D9E0] shadow-sm p-6 flex items-start gap-5">
+  <!-- Shield indicator (48px) -->
+  <div class="shrink-0 flex flex-col items-center gap-2">
+    <Shield state={configured ? state : 'warning'} size={48} />
+    <span class="text-[10px] font-mono tracking-[0.08em] uppercase text-[#6B7280]">
+      {stateLabel}
+    </span>
+  </div>
+
+  <!-- Details -->
+  <div class="flex-1 min-w-0">
+    <h3 class="font-semibold text-[#1B3A6B] text-base mb-1">{platform}</h3>
+    <p class="text-sm text-[#6B7280] font-mono mb-4">
+      API Key:
+      {configured
+        ? <span class="text-[#374151]">●●●●●●●●●●●●●●●● <span class="text-[#12B76A] font-semibold">configured</span></span>
+        : <span class="text-[#F5C842]">not set</span>
+      }
+    </p>
+
+    {!configured && (
+      <div class="flex items-center gap-2 bg-[#FFFBEB] border border-[#F5C842]/50 rounded-lg px-3 py-2 mb-4">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+          <circle cx="7" cy="7" r="6" stroke="#F5C842" stroke-width="1.5"/>
+          <path d="M7 4v4M7 9.5v.5" stroke="#F5C842" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <span class="text-xs text-[#92400E]">Using mock data — set <code class="font-mono bg-[#FEF3C7] px-1 rounded">{slug.toUpperCase().replace('-','')}_API_KEY</code> in env to connect</span>
+      </div>
+    )}
+
+    <!-- Test connection button (JS-powered) -->
+    <button
+      type="button"
+      data-test-url={`/api/${slug}/test-connection`}
+      class="test-conn-btn inline-flex items-center gap-2 text-sm font-medium text-[#1B3A6B] hover:text-[#2A5298] border border-[#D1D9E0] hover:border-[#1B3A6B] rounded-lg px-4 py-2 transition-colors"
+    >
+      Test Connection →
+    </button>
+    <span class="test-conn-result ml-3 text-xs font-mono text-[#6B7280]"></span>
+  </div>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('.test-conn-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const url = btn.dataset.testUrl!;
+      const resultEl = btn.nextElementSibling as HTMLElement;
+      btn.disabled = true;
+      btn.textContent = 'Testing…';
+      resultEl.textContent = '';
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.ok) {
+          resultEl.textContent = `✓ Connected · ${data.latencyMs}ms`;
+          resultEl.className = 'test-conn-result ml-3 text-xs font-mono text-[#12B76A]';
+        } else {
+          resultEl.textContent = data.message ?? 'Connection failed';
+          resultEl.className = 'test-conn-result ml-3 text-xs font-mono text-[#F04438]';
+        }
+      } catch {
+        resultEl.textContent = 'Request error';
+        resultEl.className = 'test-conn-result ml-3 text-xs font-mono text-[#F04438]';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Test Connection →';
+    });
+  });
+</script>
