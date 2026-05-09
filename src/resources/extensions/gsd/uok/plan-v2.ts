@@ -1,24 +1,34 @@
+// Project/App: GSD-2
+// File Purpose: UOK plan v2 graph compilation from GSD workflow state.
+
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { GSDState, Phase } from "../types.js";
 import { gsdRoot, resolveMilestoneFile, resolveSliceFile } from "../paths.js";
-import { isDbAvailable, getMilestoneSlices, getSliceTasks, type SliceRow } from "../gsd-db.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "../gsd-db.js";
+import type { SliceRow } from "../db-task-slice-rows.js";
 import type { UokGraphNode } from "./contracts.js";
 
 const PLAN_V2_CLARIFY_ROUND_LIMIT = 3;
-const EXECUTION_ENTRY_PHASES: ReadonlySet<Phase> = new Set([
+export const EXECUTION_ENTRY_PHASES: ReadonlySet<Phase> = new Set([
   "executing",
   "summarizing",
   "validating-milestone",
   "completing-milestone",
 ]);
 
+export function isExecutionEntryPhase(phase: Phase): boolean {
+  return EXECUTION_ENTRY_PHASES.has(phase);
+}
+
 export interface PlanV2CompileResult {
   ok: boolean;
   reason?: string;
+  emptyGraph?: boolean;
   graphPath?: string;
   nodeCount?: number;
+  sliceCount?: number;
   clarifyRoundLimit?: number;
   researchSynthesized?: boolean;
   draftContextIncluded?: boolean;
@@ -61,6 +71,18 @@ function hasMilestoneFileContent(
   return false;
 }
 
+export function hasFinalizedMilestoneContext(basePath: string, milestoneId: string): boolean {
+  return hasMilestoneFileContent(basePath, milestoneId, "CONTEXT");
+}
+
+export function isMissingFinalizedContextResult(result: PlanV2CompileResult): boolean {
+  return !result.ok && result.finalizedContextIncluded === false;
+}
+
+export function isEmptyPlanV2GraphResult(result: PlanV2CompileResult): boolean {
+  return !result.ok && result.emptyGraph === true;
+}
+
 function countSliceResearchArtifacts(basePath: string, milestoneId: string, slices: SliceRow[]): number {
   let count = 0;
   for (const slice of slices) {
@@ -69,10 +91,6 @@ function countSliceResearchArtifacts(basePath: string, milestoneId: string, slic
     }
   }
   return count;
-}
-
-function isExecutionEntryPhase(phase: Phase): boolean {
-  return EXECUTION_ENTRY_PHASES.has(phase);
 }
 
 export function compileUnitGraphFromState(basePath: string, state: GSDState): PlanV2CompileResult {
@@ -162,6 +180,7 @@ export function compileUnitGraphFromState(basePath: string, state: GSDState): Pl
     ok: true,
     graphPath: outPath,
     nodeCount: nodes.length,
+    sliceCount: slices.length,
     clarifyRoundLimit,
     researchSynthesized: output.pipeline.researchSynthesized,
     draftContextIncluded: output.pipeline.draftContextIncluded,
@@ -173,7 +192,18 @@ export function ensurePlanV2Graph(basePath: string, state: GSDState): PlanV2Comp
   const compiled = compileUnitGraphFromState(basePath, state);
   if (!compiled.ok) return compiled;
   if ((compiled.nodeCount ?? 0) <= 0) {
-    return { ok: false, reason: "compiled graph is empty" };
+    if (
+      (state.phase === "validating-milestone" || state.phase === "completing-milestone") &&
+      (compiled.sliceCount ?? 0) > 0
+    ) {
+      return compiled;
+    }
+    return {
+      ...compiled,
+      ok: false,
+      reason: "compiled graph is empty",
+      emptyGraph: true,
+    };
   }
   return compiled;
 }

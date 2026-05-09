@@ -1,25 +1,21 @@
+// Project/App: GSD-2
+// File Purpose: Registers DB-backed GSD workflow tools and compatibility aliases.
 import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 import { Text } from "@gsd/pi-tui";
 
-import { findMilestoneIds, nextMilestoneId, claimReservedId, getReservedMilestoneIds } from "../guided-flow.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
-import { ensureDbOpen } from "./dynamic-tools.js";
+import { ensureDbOpen, resolveCtxCwd } from "./dynamic-tools.js";
+import { loadWriteGateSnapshot, shouldBlockRootArtifactSaveInSnapshot } from "./write-gate.js";
 import { StringEnum } from "@gsd/pi-ai";
 import { logError } from "../workflow-logger.js";
 import { getErrorMessage } from "../error-utils.js";
-import {
-  executeCompleteMilestone,
-  executePlanMilestone,
-  executePlanSlice,
-  executeReplanSlice,
-  executeReassessRoadmap,
-  executeSaveGateResult,
-  executeSliceComplete,
-  executeSummarySave,
-  executeTaskComplete,
-  executeValidateMilestone,
-} from "../tools/workflow-tool-executors.js";
+import { incrementLegacyTelemetry } from "../legacy-telemetry.js";
+
+async function loadWorkflowExecutors(): Promise<typeof import("../tools/workflow-tool-executors.js")> {
+  return import("../tools/workflow-tool-executors.js");
+}
+
 
 /**
  * Register an alias tool that shares the same execute function as its canonical counterpart.
@@ -27,12 +23,30 @@ import {
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- toolDef shape matches ToolDefinition but typing it fully requires generics
 function registerAlias(pi: ExtensionAPI, toolDef: any, aliasName: string, canonicalName: string): void {
+  const execute = typeof toolDef.execute === "function"
+    ? async (...args: any[]) => {
+        incrementLegacyTelemetry("legacy.mcpAliasUsed");
+        return toolDef.execute(...args);
+      }
+    : toolDef.execute;
+
   pi.registerTool({
     ...toolDef,
     name: aliasName,
     description: toolDef.description + ` (alias for ${canonicalName} — prefer the canonical name)`,
     promptGuidelines: [`Alias for ${canonicalName} — prefer the canonical name.`],
+    execute,
   });
+}
+
+function requirementRootWriteGuard(operation: string, basePath: string): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError: true } | null {
+  const guard = shouldBlockRootArtifactSaveInSnapshot(loadWriteGateSnapshot(basePath), "REQUIREMENTS");
+  if (!guard.block) return null;
+  return {
+    content: [{ type: "text", text: `Error ${operation} requirement: ${guard.reason ?? "requirements write blocked"}` }],
+    details: { operation, error: "root_artifact_write_blocked" },
+    isError: true,
+  };
 }
 
 /**
@@ -52,7 +66,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_decision_save (formerly gsd_save_decision) ─────────────────────
 
   const decisionSaveExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    const dbAvailable = await ensureDbOpen();
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) {
       return {
         content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot save decision." }],
@@ -71,7 +86,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
           when_context: params.when_context,
           made_by: params.made_by,
         },
-        process.cwd(),
+        basePath,
       );
       return {
         content: [{ type: "text" as const, text: `Saved decision ${id}` }],
@@ -139,7 +154,10 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_requirement_update (formerly gsd_update_requirement) ───────────
 
   const requirementUpdateExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    const dbAvailable = await ensureDbOpen();
+    const basePath = resolveCtxCwd(_ctx);
+    const gateBlock = requirementRootWriteGuard("update_requirement", basePath);
+    if (gateBlock) return gateBlock;
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) {
       return {
         content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot update requirement." }],
@@ -155,7 +173,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
       if (params.description !== undefined) updates.description = params.description;
       if (params.primary_owner !== undefined) updates.primary_owner = params.primary_owner;
       if (params.supporting_slices !== undefined) updates.supporting_slices = params.supporting_slices;
-      await updateRequirementInDb(params.id, updates, process.cwd());
+      await updateRequirementInDb(params.id, updates, basePath);
       return {
         content: [{ type: "text" as const, text: `Updated requirement ${params.id}` }],
         details: { operation: "update_requirement", id: params.id } as any,
@@ -217,7 +235,10 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_requirement_save ─────────────────────────────────────────────
 
   const requirementSaveExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    const dbAvailable = await ensureDbOpen();
+    const basePath = resolveCtxCwd(_ctx);
+    const gateBlock = requirementRootWriteGuard("save_requirement", basePath);
+    if (gateBlock) return gateBlock;
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) {
       return {
         content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot save requirement." }],
@@ -238,7 +259,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
           validation: params.validation,
           notes: params.notes,
         },
-        process.cwd(),
+        basePath,
       );
       return {
         content: [{ type: "text" as const, text: `Saved requirement ${result.id}` }],
@@ -262,13 +283,28 @@ export function registerDbTools(pi: ExtensionAPI): void {
       "Requirement IDs are auto-assigned — never provide an ID manually.",
     promptSnippet: "Record a new GSD requirement to the database (auto-assigns ID, regenerates REQUIREMENTS.md)",
     promptGuidelines: [
-      "Use gsd_requirement_save when recording a new functional, non-functional, or operational requirement.",
+      "Use gsd_requirement_save when recording a new capability, quality attribute, constraint, or anti-feature requirement.",
+      "Use one of these classes: core-capability, primary-user-loop, launchability, continuity, failure-visibility, integration, quality-attribute, operability, admin/support, compliance/security, differentiator, constraint, anti-feature.",
       "Requirement IDs are auto-assigned (R001, R002, ...) — never guess or provide an ID.",
       "class, description, why, and source are required. All other fields are optional.",
       "The tool writes to the DB and regenerates .gsd/REQUIREMENTS.md automatically.",
     ],
     parameters: Type.Object({
-      class: Type.String({ description: "Requirement class (e.g. 'functional', 'non-functional', 'operational')" }),
+      class: StringEnum([
+        "core-capability",
+        "primary-user-loop",
+        "launchability",
+        "continuity",
+        "failure-visibility",
+        "integration",
+        "quality-attribute",
+        "operability",
+        "admin/support",
+        "compliance/security",
+        "differentiator",
+        "constraint",
+        "anti-feature",
+      ], { description: "Requirement class" }),
       description: Type.String({ description: "Short description of the requirement" }),
       why: Type.String({ description: "Why this requirement matters" }),
       source: Type.String({ description: "Origin of the requirement (e.g. 'user-research', 'design', 'M001')" }),
@@ -302,7 +338,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_summary_save (formerly gsd_save_summary) ──────────────────────
 
   const summarySaveExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeSummarySave(params, process.cwd());
+    const { executeSummarySave } = await loadWorkflowExecutors();
+    return executeSummarySave(params, resolveCtxCwd(_ctx));
   };
 
   const summarySaveTool = {
@@ -313,17 +350,18 @@ export function registerDbTools(pi: ExtensionAPI): void {
       "Computes the file path from milestone/slice/task IDs automatically.",
     promptSnippet: "Save a GSD artifact (summary/research/context/assessment) to DB and disk",
     promptGuidelines: [
-      "Use gsd_summary_save to persist structured artifacts (SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT).",
-      "milestone_id is required. slice_id and task_id are optional — they determine the file path.",
+      "Use gsd_summary_save to persist structured artifacts (SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT, PROJECT, PROJECT-DRAFT, REQUIREMENTS, REQUIREMENTS-DRAFT).",
+      "milestone_id is required for milestone/slice/task artifacts. Omit milestone_id only for root-level PROJECT/PROJECT-DRAFT/REQUIREMENTS/REQUIREMENTS-DRAFT.",
       "The tool computes the relative path automatically: milestones/M001/M001-SUMMARY.md, milestones/M001/slices/S01/S01-SUMMARY.md, etc.",
-      "artifact_type must be one of: SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT.",
+      "Root-level artifact paths are PROJECT.md, PROJECT-DRAFT.md, REQUIREMENTS.md, and REQUIREMENTS-DRAFT.md.",
+      "artifact_type must be one of: SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT, PROJECT, PROJECT-DRAFT, REQUIREMENTS, REQUIREMENTS-DRAFT.",
       "Use CONTEXT-DRAFT for incremental draft persistence; use CONTEXT for the final milestone context after depth verification.",
     ],
     parameters: Type.Object({
-      milestone_id: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      milestone_id: Type.Optional(Type.String({ description: "Milestone ID (e.g. M001). Omit only for root-level PROJECT/PROJECT-DRAFT/REQUIREMENTS/REQUIREMENTS-DRAFT artifacts." })),
       slice_id: Type.Optional(Type.String({ description: "Slice ID (e.g. S01)" })),
       task_id: Type.Optional(Type.String({ description: "Task ID (e.g. T01)" })),
-      artifact_type: Type.String({ description: "One of: SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT" }),
+      artifact_type: StringEnum(["SUMMARY", "RESEARCH", "CONTEXT", "ASSESSMENT", "CONTEXT-DRAFT", "PROJECT", "PROJECT-DRAFT", "REQUIREMENTS", "REQUIREMENTS-DRAFT"], { description: "Artifact type to save" }),
       content: Type.String({ description: "The full markdown content of the artifact" }),
     }),
     execute: summarySaveExecute,
@@ -352,23 +390,24 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   const milestoneGenerateIdExecute = async (_toolCallId: string, _params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     try {
+      const basePath = resolveCtxCwd(_ctx);
       // Claim a reserved ID if the guided-flow already previewed one to the user.
       // This guarantees the ID shown in the UI matches the one materialised on disk.
+      const { claimReservedId, findMilestoneIds, getReservedMilestoneIds, nextMilestoneId } = await import("../guided-flow.js");
       const reserved = claimReservedId();
       if (reserved) {
-        await ensureMilestoneDbRow(reserved);
+        await ensureMilestoneDbRow(reserved, basePath);
         return {
           content: [{ type: "text" as const, text: reserved }],
           details: { operation: "generate_milestone_id", id: reserved, source: "reserved" } as any,
         };
       }
 
-      const basePath = process.cwd();
       const existingIds = findMilestoneIds(basePath);
-      const uniqueEnabled = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
+      const uniqueEnabled = !!loadEffectiveGSDPreferences(basePath)?.preferences?.unique_milestone_ids;
       const allIds = [...new Set([...existingIds, ...getReservedMilestoneIds()])];
       const newId = nextMilestoneId(allIds, uniqueEnabled);
-      await ensureMilestoneDbRow(newId);
+      await ensureMilestoneDbRow(newId, basePath);
       return {
         content: [{ type: "text" as const, text: newId }],
         details: { operation: "generate_milestone_id", id: newId, existingCount: existingIds.length, uniqueEnabled } as any,
@@ -388,8 +427,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
    * later writes the full row. Silently skips if the DB isn't available yet
    * (pre-migration).
    */
-  async function ensureMilestoneDbRow(milestoneId: string): Promise<void> {
-    const dbAvailable = await ensureDbOpen();
+  async function ensureMilestoneDbRow(milestoneId: string, basePath: string): Promise<void> {
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) return;
     try {
       const { insertMilestone } = await import("../gsd-db.js");
@@ -435,7 +474,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_plan_milestone (gsd_milestone_plan alias) ─────────────────────
 
   const planMilestoneExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executePlanMilestone(params, process.cwd());
+    const { executePlanMilestone } = await loadWorkflowExecutors();
+    return executePlanMilestone(params, resolveCtxCwd(_ctx));
   };
 
   const planMilestoneTool = {
@@ -491,6 +531,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
       definitionOfDone: Type.Optional(Type.Array(Type.String(), { description: "Definition of done bullets" })),
       requirementCoverage: Type.Optional(Type.String({ description: "Requirement coverage text" })),
       boundaryMapMarkdown: Type.Optional(Type.String({ description: "Boundary map markdown block" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'plan-phase complete')" })),
     }),
     execute: planMilestoneExecute,
   };
@@ -501,7 +544,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_plan_slice (gsd_slice_plan alias) ─────────────────────────────
 
   const planSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executePlanSlice(params, process.cwd());
+    const { executePlanSlice } = await loadWorkflowExecutors();
+    return executePlanSlice(params, resolveCtxCwd(_ctx));
   };
 
   const planSliceTool = {
@@ -537,6 +581,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
       proofLevel: Type.Optional(Type.String({ description: "Slice proof level" })),
       integrationClosure: Type.Optional(Type.String({ description: "Slice integration closure" })),
       observabilityImpact: Type.Optional(Type.String({ description: "Slice observability impact" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'plan-phase complete')" })),
     }),
     execute: planSliceExecute,
   };
@@ -547,7 +594,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_plan_task (gsd_task_plan alias) ───────────────────────────────
 
   const planTaskExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    const dbAvailable = await ensureDbOpen();
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) {
       return {
         content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot plan task." }],
@@ -556,7 +604,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
     }
     try {
       const { handlePlanTask } = await import("../tools/plan-task.js");
-      const result = await handlePlanTask(params, process.cwd());
+      const result = await handlePlanTask(params, basePath);
       if ("error" in result) {
         return {
           content: [{ type: "text" as const, text: `Error planning task: ${result.error}` }],
@@ -607,6 +655,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
       inputs: Type.Array(Type.String(), { description: "Input files or references" }),
       expectedOutput: Type.Array(Type.String(), { description: "Expected output files or artifacts" }),
       observabilityImpact: Type.Optional(Type.String({ description: "Task observability impact" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'plan-phase complete')" })),
     }),
     execute: planTaskExecute,
   };
@@ -617,7 +668,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_task_complete (gsd_complete_task alias) ────────────────────────
 
   const taskCompleteExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeTaskComplete(params, process.cwd());
+    const { executeTaskComplete } = await loadWorkflowExecutors();
+    return executeTaskComplete(params, resolveCtxCwd(_ctx));
   };
 
   const taskCompleteTool = {
@@ -674,6 +726,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
         ]),
         { description: "Array of verification evidence entries" },
       )),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'task verified after retry')" })),
     }),
     execute: taskCompleteExecute,
   };
@@ -684,7 +739,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_slice_complete (gsd_complete_slice alias) ─────────────────────
 
   const sliceCompleteExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeSliceComplete(params, process.cwd());
+    const { executeSliceComplete } = await loadWorkflowExecutors();
+    return executeSliceComplete(params, resolveCtxCwd(_ctx));
   };
 
   const sliceCompleteTool = {
@@ -771,6 +827,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
         ]),
         { description: "Upstream slice dependencies consumed" },
       )),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'all tasks verified')" })),
     }),
     execute: sliceCompleteExecute,
   };
@@ -781,7 +840,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_skip_slice (#3477 / #3487) ───────────────────────────────────
 
   const skipSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    const dbAvailable = await ensureDbOpen();
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
     if (!dbAvailable) {
       return {
         content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot skip slice." }],
@@ -814,7 +874,6 @@ export function registerDbTools(pi: ExtensionAPI): void {
       // Rebuild STATE.md so it reflects the skip immediately (#3477).
       // Without this, /gsd auto reads stale STATE.md and resumes the skipped slice.
       try {
-        const basePath = process.cwd();
         const { rebuildState } = await import("../doctor.js");
         await rebuildState(basePath);
       } catch (err) {
@@ -873,7 +932,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_complete_milestone ────────────────────────────────────────────
 
   const milestoneCompleteExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeCompleteMilestone(params, process.cwd());
+    const { executeCompleteMilestone } = await loadWorkflowExecutors();
+    return executeCompleteMilestone(params, resolveCtxCwd(_ctx));
   };
 
   const milestoneCompleteTool = {
@@ -905,6 +965,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
       lessonsLearned: Type.Optional(Type.Array(Type.String(), { description: "Lessons learned during the milestone" })),
       followUps: Type.Optional(Type.String({ description: "Follow-up items for future milestones" })),
       deviations: Type.Optional(Type.String({ description: "Deviations from the original plan" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'milestone validation passed')" })),
     }),
     execute: milestoneCompleteExecute,
   };
@@ -915,7 +978,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_validate_milestone (gsd_milestone_validate alias) ─────────────
 
   const milestoneValidateExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeValidateMilestone(params, process.cwd());
+    const { executeValidateMilestone } = await loadWorkflowExecutors();
+    return executeValidateMilestone(params, resolveCtxCwd(_ctx));
   };
 
   const milestoneValidateTool = {
@@ -952,7 +1016,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_replan_slice (gsd_slice_replan alias) ─────────────────────────
 
   const replanSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeReplanSlice(params, process.cwd());
+    const { executeReplanSlice } = await loadWorkflowExecutors();
+    return executeReplanSlice(params, resolveCtxCwd(_ctx));
   };
 
   const replanSliceTool = {
@@ -989,6 +1054,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
         { description: "Tasks to upsert (update existing or insert new)" },
       ),
       removedTaskIds: Type.Array(Type.String(), { description: "Task IDs to remove from the slice" }),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'blocker discovered during execution')" })),
     }),
     execute: replanSliceExecute,
   };
@@ -999,7 +1067,8 @@ export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_reassess_roadmap (gsd_roadmap_reassess alias) ─────────────────
 
   const reassessRoadmapExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeReassessRoadmap(params, process.cwd());
+    const { executeReassessRoadmap } = await loadWorkflowExecutors();
+    return executeReassessRoadmap(params, resolveCtxCwd(_ctx));
   };
 
   const reassessRoadmapTool = {
@@ -1044,6 +1113,9 @@ export function registerDbTools(pi: ExtensionAPI): void {
         ),
         removed: Type.Array(Type.String(), { description: "Slice IDs to remove" }),
       }, { description: "Slice changes to apply" }),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'slice S01 completed, reassessing remaining roadmap')" })),
     }),
     execute: reassessRoadmapExecute,
   };
@@ -1051,10 +1123,211 @@ export function registerDbTools(pi: ExtensionAPI): void {
   pi.registerTool(reassessRoadmapTool);
   registerAlias(pi, reassessRoadmapTool, "gsd_roadmap_reassess", "gsd_reassess_roadmap");
 
+  // ─── gsd_task_reopen (gsd_reopen_task alias) ───────────────────────────
+  // Single-writer v3, Stream 3: reversibility tools for closed units.
+
+  const reopenTaskExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot reopen task." }],
+        details: { operation: "reopen_task", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handleReopenTask } = await import("../tools/reopen-task.js");
+      const result = await handleReopenTask(params, basePath);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error reopening task: ${result.error}` }],
+          details: { operation: "reopen_task", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Reopened task ${result.taskId} (${result.sliceId}/${result.milestoneId})` }],
+        details: {
+          operation: "reopen_task",
+          milestoneId: result.milestoneId,
+          sliceId: result.sliceId,
+          taskId: result.taskId,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logError("tool", `reopen_task tool failed: ${msg}`, { tool: "gsd_task_reopen", error: String(err) });
+      return {
+        content: [{ type: "text" as const, text: `Error reopening task: ${msg}` }],
+        details: { operation: "reopen_task", error: msg } as any,
+      };
+    }
+  };
+
+  const reopenTaskTool = {
+    name: "gsd_task_reopen",
+    label: "Reopen Task",
+    description:
+      "Reset a completed task back to 'pending' so it can be re-done. Cleans up SUMMARY.md so the DB-filesystem reconciler does not auto-correct the task back to complete. " +
+      "Both the parent slice and milestone must still be open — use gsd_slice_reopen first if the slice has been closed.",
+    promptSnippet: "Reopen a completed GSD task (resets status to pending, removes SUMMARY.md)",
+    promptGuidelines: [
+      "Use gsd_task_reopen when a completed task needs to be re-done (e.g. verification missed a regression, requirements changed).",
+      "Will fail if the parent slice or milestone is already closed — reopen those first.",
+      "Will fail if the task is not currently 'complete' — there is nothing to reopen.",
+      "Use the canonical name gsd_task_reopen; gsd_reopen_task is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      taskId: Type.String({ description: "Task ID (e.g. T01)" }),
+      reason: Type.Optional(Type.String({ description: "Why the task is being reopened (recorded in the audit trail)" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'regression discovered post-completion')" })),
+    }),
+    execute: reopenTaskExecute,
+  };
+
+  pi.registerTool(reopenTaskTool);
+  registerAlias(pi, reopenTaskTool, "gsd_reopen_task", "gsd_task_reopen");
+
+  // ─── gsd_slice_reopen (gsd_reopen_slice alias) ─────────────────────────
+
+  const reopenSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot reopen slice." }],
+        details: { operation: "reopen_slice", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handleReopenSlice } = await import("../tools/reopen-slice.js");
+      const result = await handleReopenSlice(params, basePath);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error reopening slice: ${result.error}` }],
+          details: { operation: "reopen_slice", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Reopened slice ${result.sliceId} (${result.milestoneId}); reset ${result.tasksReset} task(s) to pending.` }],
+        details: {
+          operation: "reopen_slice",
+          milestoneId: result.milestoneId,
+          sliceId: result.sliceId,
+          tasksReset: result.tasksReset,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logError("tool", `reopen_slice tool failed: ${msg}`, { tool: "gsd_slice_reopen", error: String(err) });
+      return {
+        content: [{ type: "text" as const, text: `Error reopening slice: ${msg}` }],
+        details: { operation: "reopen_slice", error: msg } as any,
+      };
+    }
+  };
+
+  const reopenSliceTool = {
+    name: "gsd_slice_reopen",
+    label: "Reopen Slice",
+    description:
+      "Reset a completed slice back to 'in_progress' and reset ALL of its tasks back to 'pending'. Cleans up SUMMARY.md / UAT.md and per-task summaries. " +
+      "Reopening a slice means re-doing the work — partial resets create ambiguous state, so all tasks are reset.",
+    promptSnippet: "Reopen a completed GSD slice (resets all tasks to pending, removes summaries)",
+    promptGuidelines: [
+      "Use gsd_slice_reopen when a completed slice needs to be re-done (e.g. integration issue surfaced, requirements changed).",
+      "All tasks within the slice are reset to 'pending' — there is no partial-reopen.",
+      "Will fail if the parent milestone is already closed — reopen the milestone first.",
+      "Will fail if the slice is not currently 'complete' — there is nothing to reopen.",
+      "Use the canonical name gsd_slice_reopen; gsd_reopen_slice is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      reason: Type.Optional(Type.String({ description: "Why the slice is being reopened (recorded in the audit trail)" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'cross-slice regression discovered')" })),
+    }),
+    execute: reopenSliceExecute,
+  };
+
+  pi.registerTool(reopenSliceTool);
+  registerAlias(pi, reopenSliceTool, "gsd_reopen_slice", "gsd_slice_reopen");
+
+  // ─── gsd_milestone_reopen (gsd_reopen_milestone alias) ─────────────────
+
+  const reopenMilestoneExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const basePath = resolveCtxCwd(_ctx);
+    const dbAvailable = await ensureDbOpen(basePath);
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot reopen milestone." }],
+        details: { operation: "reopen_milestone", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handleReopenMilestone } = await import("../tools/reopen-milestone.js");
+      const result = await handleReopenMilestone(params, basePath);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error reopening milestone: ${result.error}` }],
+          details: { operation: "reopen_milestone", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Reopened milestone ${result.milestoneId}; reset ${result.slicesReset} slice(s) and ${result.tasksReset} task(s).` }],
+        details: {
+          operation: "reopen_milestone",
+          milestoneId: result.milestoneId,
+          slicesReset: result.slicesReset,
+          tasksReset: result.tasksReset,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logError("tool", `reopen_milestone tool failed: ${msg}`, { tool: "gsd_milestone_reopen", error: String(err) });
+      return {
+        content: [{ type: "text" as const, text: `Error reopening milestone: ${msg}` }],
+        details: { operation: "reopen_milestone", error: msg } as any,
+      };
+    }
+  };
+
+  const reopenMilestoneTool = {
+    name: "gsd_milestone_reopen",
+    label: "Reopen Milestone",
+    description:
+      "Reset a closed milestone back to 'active', all of its slices to 'in_progress', and all tasks to 'pending'. " +
+      "Cleans up MILESTONE-SUMMARY.md, slice summaries, and task summaries so the DB-filesystem reconciler does not auto-correct status back to complete.",
+    promptSnippet: "Reopen a closed GSD milestone (resets slices and tasks, removes summaries)",
+    promptGuidelines: [
+      "Use gsd_milestone_reopen when a closed milestone needs to be re-done (e.g. validation failure surfaced after closure).",
+      "All slices reset to 'in_progress' and all tasks reset to 'pending' — no partial reopen.",
+      "Will fail if the milestone is not currently closed — there is nothing to reopen.",
+      "Use the canonical name gsd_milestone_reopen; gsd_reopen_milestone is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      reason: Type.Optional(Type.String({ description: "Why the milestone is being reopened (recorded in the audit trail)" })),
+      // Single-writer v3 audit trail (Stream 2): caller-provided actor identity + causation.
+      actorName: Type.Optional(Type.String({ description: "Caller-provided actor identity for the audit trail (e.g. 'executor-01', 'gsd-orchestrator')" })),
+      triggerReason: Type.Optional(Type.String({ description: "Caller-provided reason this action was triggered (e.g. 'post-closure validation failure')" })),
+    }),
+    execute: reopenMilestoneExecute,
+  };
+
+  pi.registerTool(reopenMilestoneTool);
+  registerAlias(pi, reopenMilestoneTool, "gsd_reopen_milestone", "gsd_milestone_reopen");
+
   // ─── gsd_save_gate_result ──────────────────────────────────────────────
 
   const saveGateResultExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
-    return executeSaveGateResult(params, process.cwd());
+    const { executeSaveGateResult } = await loadWorkflowExecutors();
+    return executeSaveGateResult(params, resolveCtxCwd(_ctx));
   };
 
   const saveGateResultTool = {

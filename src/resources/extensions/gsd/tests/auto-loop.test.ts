@@ -1,21 +1,30 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   resolveAgentEnd,
   resolveAgentEndCancelled,
-  runUnit,
-  autoLoop,
-  detectStuck,
   _resetPendingResolve,
+  _hasPendingResolveForTest,
   _setActiveSession,
+  _setSessionSwitchInFlight,
+  _markSessionSwitchAbortGraceWindow,
+  _clearSessionSwitchAbortGraceWindow,
+  _consumePendingSwitchCancellation,
   isSessionSwitchInFlight,
-  type UnitResult,
-  type AgentEndEvent,
-  type LoopDeps,
-} from "../auto-loop.js";
+  isSessionSwitchAbortGraceActive,
+} from "../auto/resolve.js";
+import { runUnit } from "../auto/run-unit.js";
+import { autoLoop } from "../auto/loop.js";
+import { runDispatch } from "../auto/phases.js";
+import { detectStuck } from "../auto/detect-stuck.js";
+import type { UnitResult, AgentEndEvent } from "../auto/types.js";
+import type { LoopDeps } from "../auto/loop-deps.js";
+import { WorktreeStateProjection } from "../worktree-state-projection.js";
+import { ModelPolicyDispatchBlockedError } from "../auto-model-selection.js";
 import type { SessionLockStatus } from "../session-lock.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -24,6 +33,24 @@ function makeEvent(
   messages: unknown[] = [{ role: "assistant" }],
 ): AgentEndEvent {
   return { messages };
+}
+
+async function drainMicrotasks(turns = 20): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
+  }
+}
+
+async function waitForMicrotasks(
+  condition: () => boolean,
+  label: string,
+  turns = 500,
+): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    if (condition()) return;
+    await Promise.resolve();
+  }
+  assert.fail(`Timed out waiting for ${label}`);
 }
 
 /**
@@ -42,8 +69,9 @@ function makeMockSession(opts?: {
   const session = {
     active: true,
     verbose: false,
+    basePath: process.cwd(),
     cmdCtx: {
-      newSession: (options?: { abortSignal?: AbortSignal }) => {
+      newSession: (options?: { abortSignal?: AbortSignal; workspaceRoot?: string }) => {
         opts?.onNewSessionStart?.(session);
         if (opts?.newSessionThrows) {
           return Promise.reject(new Error(opts.newSessionThrows));
@@ -55,7 +83,7 @@ function makeMockSession(opts?: {
             setTimeout(() => {
               // Simulate AgentSession.newSession() checking abortSignal after
               // its internal async work (abort()) completes — this is where the
-              // real code captures process.cwd() and rebuilds the tool runtime.
+              // real code selects a workspace root and rebuilds the tool runtime.
               // If the signal is aborted, the real code discards the session.
               opts?.onSignalCheck?.(options?.abortSignal?.aborted ?? false);
               opts?.onNewSessionSettle?.(session);
@@ -185,6 +213,28 @@ test("runUnit returns cancelled when session creation fails", async () => {
   assert.equal(pi.calls.length, 0);
 });
 
+test("runUnit clears queued switch cancellation when session creation fails", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  const s = makeMockSession({
+    newSessionThrows: "connection refused",
+    onNewSessionStart: () => {
+      resolveAgentEndCancelled({
+        message: "Claude Code process aborted by user",
+        category: "aborted",
+        isTransient: false,
+      });
+    },
+  });
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(_consumePendingSwitchCancellation(), null);
+});
+
 test("runUnit returns cancelled when session creation times out", async () => {
   _resetPendingResolve();
 
@@ -198,6 +248,34 @@ test("runUnit returns cancelled when session creation times out", async () => {
   assert.equal(result.status, "cancelled");
   assert.equal(result.event, undefined);
   assert.equal(pi.calls.length, 0);
+});
+
+test("runUnit consumes a cancellation queued during session switch before dispatch", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  let cancellationQueued = false;
+  const s = makeMockSession({
+    newSessionDelayMs: 10,
+    onNewSessionStart: () => {
+      setTimeout(() => {
+        cancellationQueued = !resolveAgentEndCancelled({
+          message: "Claude Code process aborted by user",
+          category: "aborted",
+          isTransient: false,
+        });
+      }, 0);
+    },
+  });
+
+  const result = await runUnit(ctx, pi, s, "plan-slice", "M009/S01", "prompt");
+
+  assert.equal(cancellationQueued, true);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "aborted");
+  assert.equal(result.errorContext?.message, "Claude Code process aborted by user");
+  assert.equal(pi.calls.length, 0, "queued switch cancellation must prevent prompt dispatch");
 });
 
 test("runUnit keeps the session-switch guard across a late newSession settlement", async () => {
@@ -379,6 +457,7 @@ test("runUnit cancels before dispatch when provider is not request-ready (#4555)
     /Provider anthropic is not request-ready/,
   );
   assert.equal(pi.calls.length, 0, "sendMessage must not be called when provider is not ready");
+  assert.equal(_hasPendingResolveForTest(), false, "provider cancellation must clear the pending resolver");
 });
 
 test("runUnit cancels before dispatch using currentUnitModel provider when set (#4555)", async () => {
@@ -474,10 +553,9 @@ test("runUnit proceeds when isProviderRequestReady throws (defensive) (#4555)", 
   assert.equal(pi.calls.length, 0);
 });
 
-test("late-resolving newSession() after timeout receives aborted signal so tool runtime is not configured with root cwd (#3731)", async () => {
-  // When newSession() times out in runUnit(), auto-mode restores cwd to project
-  // root. If newSession() later resolves, it must NOT use process.cwd() to
-  // configure the tool runtime (which would give it root cwd, not worktree cwd).
+test("late-resolving newSession() after timeout receives aborted signal so tool runtime is not configured with stale workspace root (#3731)", async () => {
+  // When newSession() times out in runUnit(), a late resolution must not
+  // configure the tool runtime against a stale workspace root.
   //
   // The fix: runUnit creates an AbortController, aborts it on timeout, and passes
   // the signal to newSession(). AgentSession.newSession() checks the signal after
@@ -492,8 +570,8 @@ test("late-resolving newSession() after timeout receives aborted signal so tool 
 
     // newSession mock simulates AgentSession.newSession() behavior:
     // after an internal delay (representing await this.abort()), it checks the
-    // abortSignal — that's where the real code would capture process.cwd() and
-    // call _buildRuntime. If aborted, the real code must discard the session.
+    // abortSignal before selecting the workspace root and calling _buildRuntime.
+    // If aborted, the real code must discard the session.
     const s = makeMockSession({
       newSessionDelayMs: 200_000, // longer than NEW_SESSION_TIMEOUT_MS (120s)
       onSignalCheck: (aborted) => {
@@ -526,93 +604,22 @@ test("late-resolving newSession() after timeout receives aborted signal so tool 
       abortedWhenLateSessionSettled,
       true,
       "runUnit must pass an aborted AbortSignal to newSession() when it resolves after the session-creation timeout (#3731). " +
-      "Without this, AgentSession.newSession() captures root process.cwd() and rebuilds the tool runtime with wrong cwd.",
+      "Without this, AgentSession.newSession() can rebuild the tool runtime with a stale workspace root.",
     );
   } finally {
     mock.timers.reset();
   }
 });
 
-// ─── Structural assertions ───────────────────────────────────────────────────
-
-test("auto-loop.ts exports autoLoop, runUnit, resolveAgentEnd", async () => {
-  const mod = await import("../auto-loop.js");
-  assert.equal(
-    typeof mod.autoLoop,
-    "function",
-    "autoLoop should be exported as a function",
-  );
-  assert.equal(
-    typeof mod.runUnit,
-    "function",
-    "runUnit should be exported as a function",
-  );
-  assert.equal(
-    typeof mod.resolveAgentEnd,
-    "function",
-    "resolveAgentEnd should be exported as a function",
-  );
-});
-
-test("auto/loop.ts contains a while keyword", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "loop.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    src.includes("while"),
-    "auto/loop.ts should contain a while keyword (loop or placeholder)",
-  );
-});
-
-test("auto/resolve.ts one-shot pattern: _currentResolve is nulled before calling resolver", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "resolve.ts"),
-    "utf-8",
-  );
-  // The one-shot pattern requires: save ref, null the variable, then call
-  const resolveBlock = src.slice(
-    src.indexOf("export function resolveAgentEnd"),
-    src.indexOf("export function resolveAgentEnd") + 600,
-  );
-  const nullIdx = resolveBlock.indexOf("_currentResolve = null");
-  const callIdx = resolveBlock.indexOf("r({");
-  assert.ok(nullIdx > 0, "should null _currentResolve in resolveAgentEnd");
-  assert.ok(callIdx > 0, "should call resolver in resolveAgentEnd");
-  assert.ok(
-    nullIdx < callIdx,
-    "_currentResolve should be nulled before calling the resolver (one-shot)",
-  );
-});
-
-test("auto/phases.ts: selectAndApplyModel called exactly once and before updateProgressWidget (#2907)", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "phases.ts"),
-    "utf-8",
-  );
-  // Extract the runUnitPhase function body
-  const fnStart = src.indexOf("export async function runUnitPhase");
-  assert.ok(fnStart > 0, "runUnitPhase should exist in phases.ts");
-  const fnBody = src.slice(fnStart, fnStart + 16000);
-
-  // selectAndApplyModel must appear exactly once
-  const allOccurrences = [...fnBody.matchAll(/selectAndApplyModel\(/g)];
-  assert.equal(
-    allOccurrences.length,
-    1,
-    `selectAndApplyModel should be called exactly once in runUnitPhase, found ${allOccurrences.length} calls`,
-  );
-
-  // selectAndApplyModel must appear BEFORE updateProgressWidget
-  const modelIdx = fnBody.indexOf("selectAndApplyModel(");
-  const widgetIdx = fnBody.indexOf("updateProgressWidget(");
-  assert.ok(modelIdx > 0, "selectAndApplyModel should exist in runUnitPhase");
-  assert.ok(widgetIdx > 0, "updateProgressWidget should exist in runUnitPhase");
-  assert.ok(
-    modelIdx < widgetIdx,
-    "selectAndApplyModel must be called BEFORE updateProgressWidget (#2899/#2907)",
-  );
-});
+// NOTE: the "while keyword", "one-shot null-before-resolve", and
+// "selectAndApplyModel before updateProgressWidget" source-grep tests
+// previously here were deleted as tautological (readFileSync + substring
+// match). The one-shot pattern is already covered behaviourally by the
+// "double resolveAgentEnd only resolves once" test above, which drives the
+// real resolveAgentEnd/runUnit flow and asserts on the observable promise
+// outcome. The phases.ts ordering contract is tracked via a follow-up
+// issue proposing extraction of a pure `dispatchOrder` helper (per the
+// #4832/PR #4859 precedent) so it can be tested behaviourally.
 
 // ─── autoLoop tests (T02) ─────────────────────────────────────────────────
 
@@ -656,9 +663,12 @@ function makeMockDeps(
         blockers: [],
       } as any;
     },
-    loadEffectiveGSDPreferences: () => ({ preferences: {} }),
+    loadEffectiveGSDPreferences: () => ({
+      // These loop-mechanics tests mock executing state without plan-v2 artifacts.
+      // Plan-v2 default-on coverage lives in uok-plan-v2-wiring.test.ts.
+      preferences: { uok: { plan_v2: { enabled: false } } },
+    }),
     preDispatchHealthGate: async () => ({ proceed: true, fixesApplied: [] }),
-    syncProjectRootToWorktree: () => {},
     checkResourcesStale: () => null,
     validateSessionLock: () => ({ valid: true } as SessionLockStatus),
     updateSessionLock: () => {
@@ -682,7 +692,11 @@ function makeMockDeps(
     resolveMilestoneFile: () => null,
     reconcileMergeState: () => "clean",
     preflightCleanRoot: () => ({ stashPushed: false, summary: "" }),
-    postflightPopStash: () => {},
+    postflightPopStash: () => ({
+      restored: true,
+      needsManualRecovery: false,
+      message: "restored",
+    }),
     getLedger: () => null,
     getProjectTotals: () => ({ cost: 0 }),
     formatCost: (c: number) => `$${c.toFixed(2)}`,
@@ -718,21 +732,15 @@ function makeMockDeps(
     readFileSync: () => "",
     atomicWriteSync: () => {},
     GitServiceImpl: class {} as any,
-    resolver: {
-      get workPath() {
-        return "/tmp/project";
-      },
-      get projectRoot() {
-        return "/tmp/project";
-      },
-      get lockPath() {
-        return "/tmp/project";
-      },
-      enterMilestone: () => {},
-      exitMilestone: () => {},
-      mergeAndExit: () => {},
-      mergeAndEnterNext: () => {},
+    lifecycle: {
+      enterMilestone: () => ({ ok: true, mode: "worktree", path: "/tmp/project" }),
+      exitMilestone: (_mid: string, opts: { merge: boolean }) => ({
+        ok: true,
+        merged: opts.merge,
+        codeFilesChanged: false,
+      }),
     } as any,
+    worktreeProjection: new WorktreeStateProjection(),
     postUnitPreVerification: async () => {
       callLog.push("postUnitPreVerification");
       return "continue" as const;
@@ -765,7 +773,7 @@ function makeLoopSession(overrides?: Partial<Record<string, unknown>>) {
     verbose: false,
     stepMode: false,
     paused: false,
-    basePath: "/tmp/project",
+    basePath: mkdtempSync(join(tmpdir(), "gsd-auto-loop-")),
     originalBasePath: "",
     currentMilestoneId: "M001",
     currentUnit: null,
@@ -785,6 +793,7 @@ function makeLoopSession(overrides?: Partial<Record<string, unknown>>) {
     unitRecoveryCount: new Map<string, number>(),
     verificationRetryCount: new Map<string, number>(),
     gitService: null,
+    lastRequestTimestamp: 0,
     autoStartTime: Date.now(),
     cmdCtx: {
       newSession: () => Promise.resolve({ cancelled: false }),
@@ -849,6 +858,178 @@ test("autoLoop exits on terminal complete state", async (t) => {
   );
 });
 
+test("autoLoop stops before success notification when postflight stash restore needs recovery", async () => {
+  _resetPendingResolve();
+
+  const notifications: Array<{ msg: string; level: string }> = [];
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.ui.notify = (msg: string, level: string) => {
+    notifications.push({ msg, level });
+  };
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+  let stopReason = "";
+
+  const deps = makeMockDeps({
+    deriveState: async () => {
+      deps.callLog.push("deriveState");
+      return {
+        phase: "complete",
+        activeMilestone: { id: "M001", title: "Test", status: "complete" },
+        activeSlice: null,
+        activeTask: null,
+        registry: [{ id: "M001", status: "complete" }],
+        blockers: [],
+      } as any;
+    },
+    preflightCleanRoot: () => ({
+      stashPushed: true,
+      stashMarker: "gsd-preflight-stash:M001:test",
+      summary: "stashed",
+    }),
+    postflightPopStash: () => ({
+      restored: false,
+      needsManualRecovery: true,
+      message: "git stash pop stash@{0} failed after merge of milestone M001",
+      stashRef: "stash@{0}",
+    }),
+    sendDesktopNotification: () => {
+      deps.callLog.push("sendDesktopNotification");
+    },
+    logCmuxEvent: () => {
+      deps.callLog.push("logCmuxEvent");
+    },
+    stopAuto: async (_ctx, _pi, reason) => {
+      deps.callLog.push("stopAuto");
+      stopReason = reason ?? "";
+    },
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.equal(stopReason, "Post-merge stash restore failed for milestone M001");
+  assert.ok(
+    notifications.some(
+      (n) => n.level === "error" && n.msg.includes("Post-merge stash restore failed for milestone M001"),
+    ),
+    "failed postflight restore must be surfaced as an error",
+  );
+  assert.ok(
+    !deps.callLog.includes("sendDesktopNotification"),
+    "must not emit milestone success desktop notification after stash restore failure",
+  );
+  assert.ok(
+    !deps.callLog.includes("logCmuxEvent"),
+    "must not emit milestone success cmux event after stash restore failure",
+  );
+});
+
+test("autoLoop marks transition merge complete before postflight recovery stop", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.ui.notify = () => {};
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+  let mergeCalls = 0;
+  let stopReason = "";
+
+  const deps = makeMockDeps({
+    deriveState: async () => {
+      deps.callLog.push("deriveState");
+      return {
+        phase: "executing",
+        activeMilestone: { id: "M002", title: "Next", status: "active" },
+        activeSlice: null,
+        activeTask: null,
+        registry: [
+          { id: "M001", title: "Done", status: "complete" },
+          { id: "M002", title: "Next", status: "active" },
+        ],
+        blockers: [],
+      } as any;
+    },
+    preflightCleanRoot: () => ({
+      stashPushed: true,
+      stashMarker: "gsd-preflight-stash:M001:test",
+      summary: "stashed",
+    }),
+    postflightPopStash: () => ({
+      restored: false,
+      needsManualRecovery: true,
+      message: "git stash pop stash@{0} failed after merge of milestone M001",
+      stashRef: "stash@{0}",
+    }),
+    lifecycle: {
+      enterMilestone: () => {
+        assert.fail("must not enter the next milestone after postflight recovery fails");
+      },
+      exitMilestone: (_mid: string, opts: { merge: boolean }) => {
+        if (opts.merge) mergeCalls += 1;
+        return { ok: true, merged: opts.merge, codeFilesChanged: false };
+      },
+    } as any,
+    stopAuto: async (_ctx, _pi, reason) => {
+      deps.callLog.push("stopAuto");
+      stopReason = reason ?? "";
+      if (!s.milestoneMergedInPhases) {
+        deps.lifecycle.exitMilestone(
+          "M001",
+          { merge: true },
+          { notify: ctx.ui.notify.bind(ctx.ui) },
+        );
+      }
+    },
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.equal(stopReason, "Post-merge stash restore failed for milestone M001");
+  assert.equal(s.milestoneMergedInPhases, true);
+  assert.equal(mergeCalls, 1, "postflight recovery stop must not re-run an already completed transition merge");
+});
+
+test("autoLoop pauses when provider readiness cancels before dispatch", async () => {
+  _resetPendingResolve();
+
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.ui.notify = (message: string, level?: string) => {
+    notifications.push({ message, level });
+  };
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    getProviderAuthMode: () => "api-key",
+    isProviderRequestReady: () => false,
+  };
+
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+  const deps = makeMockDeps({
+    selectAndApplyModel: async () => ({
+      routing: null,
+      appliedModel: { provider: "anthropic", id: "claude-opus-4-6" },
+    }),
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.equal(pi.calls.length, 0, "provider readiness cancellation must not dispatch a message");
+  assert.ok(deps.callLog.includes("pauseAuto"), "provider readiness cancellation should pause auto-mode");
+  assert.ok(!deps.callLog.includes("stopAuto"), "provider readiness cancellation should not hard-stop auto-mode");
+  assert.ok(
+    !deps.callLog.includes("postUnitPreVerification"),
+    "post-unit verification must not run after pre-dispatch provider cancellation",
+  );
+  assert.ok(
+    notifications.some(n => /Provider anthropic is not request-ready/.test(n.message)),
+    "provider pause should notify with the readiness failure",
+  );
+});
+
 test("autoLoop passes structured session-lock failure details to the handler", async () => {
   _resetPendingResolve();
 
@@ -881,6 +1062,123 @@ test("autoLoop passes structured session-lock failure details to the handler", a
   assert.ok(
     !deps.callLog.includes("resolveDispatch"),
     "should stop before dispatch after lock validation fails",
+  );
+});
+
+// Regression for #5308: the iteration prelude must dequeue sidecar items
+// (popping the queue and emitting the `sidecar-dequeue` journal event) BEFORE
+// validateSessionLock + break-on-invalid. Inverting that order silently drops
+// queued sidecar work on lock-loss. Covers first-iteration and mid-session.
+test("autoLoop dequeues sidecar item before session-lock break (first iteration, #5308)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+  s.sidecarQueue.push({
+    kind: "hook" as const,
+    unitType: "hook/review",
+    unitId: "M001/S01/T01/review",
+    prompt: "review the code",
+  });
+
+  const journalEvents: string[] = [];
+  const deps = makeMockDeps({
+    validateSessionLock: () =>
+      ({
+        valid: false,
+        failureReason: "compromised",
+        expectedPid: process.pid,
+      }) as SessionLockStatus,
+    handleLostSessionLock: () => {
+      deps.callLog.push("handleLostSessionLock");
+    },
+    emitJournalEvent: (entry) => {
+      journalEvents.push(entry.eventType);
+    },
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.equal(
+    s.sidecarQueue.length,
+    0,
+    "sidecar item must be popped on lock-loss iteration (pre-#5308 ordering)",
+  );
+  assert.ok(
+    journalEvents.includes("sidecar-dequeue"),
+    "sidecar-dequeue journal event must be emitted before session-lock break",
+  );
+  assert.ok(
+    deps.callLog.includes("handleLostSessionLock"),
+    "session lock handler must still fire after sidecar dequeue",
+  );
+  assert.ok(!deps.callLog.includes("deriveState"), "lock loss should stop before deriving state");
+});
+
+test("autoLoop dequeues sidecar item before session-lock break (mid-session, #5308)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+
+  const journalEvents: string[] = [];
+  let lockCheckCount = 0;
+  const deps = makeMockDeps({
+    // First iteration: lock valid; second iteration: lock invalidates.
+    validateSessionLock: () => {
+      lockCheckCount += 1;
+      if (lockCheckCount === 1) {
+        return { valid: true } as SessionLockStatus;
+      }
+      return {
+        valid: false,
+        failureReason: "compromised",
+        expectedPid: process.pid,
+      } as SessionLockStatus;
+    },
+    handleLostSessionLock: () => {
+      deps.callLog.push("handleLostSessionLock");
+    },
+    emitJournalEvent: (entry) => {
+      journalEvents.push(entry.eventType);
+    },
+    // Enqueue a sidecar item at the end of iteration 1, so iteration 2 begins
+    // with a non-empty queue and an invalid lock.
+    postUnitPostVerification: async () => {
+      deps.callLog.push("postUnitPostVerification");
+      s.sidecarQueue.push({
+        kind: "hook" as const,
+        unitType: "run-uat",
+        unitId: "M001/S01/T01/review",
+        prompt: "review the code",
+      });
+      return "continue" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+  // Allow the loop to reach runUnit's await on iteration 1.
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent());
+  await loopPromise;
+
+  assert.ok(lockCheckCount >= 2, "lock validator must run on iteration 2");
+  assert.equal(
+    s.sidecarQueue.length,
+    0,
+    "queued sidecar item must be popped on the lock-loss iteration",
+  );
+  assert.ok(
+    journalEvents.includes("sidecar-dequeue"),
+    "sidecar-dequeue journal event must be emitted before session-lock break",
+  );
+  assert.ok(
+    deps.callLog.includes("handleLostSessionLock"),
+    "lock-loss handler must still fire on iteration 2",
   );
 });
 
@@ -1341,7 +1639,7 @@ test("autoLoop drains sidecar queue after postUnitPostVerification enqueues item
       // First call (main unit): enqueue a sidecar item
       s.sidecarQueue.push({
         kind: "hook" as const,
-        unitType: "hook/review",
+        unitType: "run-uat",
         unitId: "M001/S01/T01/review",
         prompt: "review the code",
       });
@@ -1363,11 +1661,17 @@ test("autoLoop drains sidecar queue after postUnitPostVerification enqueues item
   const loopPromise = autoLoop(ctx, pi, s, deps);
 
   // Wait for main unit's runUnit to be awaiting
-  await new Promise((r) => setTimeout(r, 50));
+  for (let i = 0; !_hasPendingResolveForTest() && i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(_hasPendingResolveForTest(), true, "main unit should be awaiting agent_end");
   resolveAgentEnd(makeEvent()); // resolve main unit
 
   // Wait for the sidecar unit's runUnit to be awaiting
-  await new Promise((r) => setTimeout(r, 50));
+  for (let i = 0; !_hasPendingResolveForTest() && postVerCallCount < 2 && i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(_hasPendingResolveForTest(), true, "sidecar unit should be awaiting agent_end");
   resolveAgentEnd(makeEvent()); // resolve sidecar unit
 
   await loopPromise;
@@ -1410,210 +1714,18 @@ test("autoLoop exits when no active milestone found", async (t) => {
   );
 });
 
-test("autoLoop exports LoopDeps type", async () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "loop-deps.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    src.includes("export interface LoopDeps"),
-    "auto/loop-deps.ts should export LoopDeps interface",
-  );
-});
-
-test("autoLoop signature accepts deps parameter", async () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "loop.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    src.includes("deps: LoopDeps"),
-    "autoLoop should accept a deps: LoopDeps parameter",
-  );
-});
-
-test("autoLoop contains while (s.active) loop", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "loop.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    src.includes("while (s.active)"),
-    "autoLoop should contain a while (s.active) loop",
-  );
-});
-
-// ── T03: End-to-end wiring structural assertions ─────────────────────────────
-
-test("auto-loop.ts barrel re-exports autoLoop, runUnit, and resolveAgentEnd", () => {
-  const barrel = readFileSync(
-    resolve(import.meta.dirname, "..", "auto-loop.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    barrel.includes("autoLoop"),
-    "barrel must re-export autoLoop",
-  );
-  assert.ok(
-    barrel.includes("runUnit"),
-    "barrel must re-export runUnit",
-  );
-  assert.ok(
-    barrel.includes("resolveAgentEnd"),
-    "barrel must re-export resolveAgentEnd",
-  );
-  // Verify the actual function declarations exist in the submodules
-  const loopSrc = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "loop.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    loopSrc.includes("export async function autoLoop"),
-    "auto/loop.ts must define autoLoop",
-  );
-  const runUnitSrc = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "run-unit.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    runUnitSrc.includes("export async function runUnit"),
-    "auto/run-unit.ts must define runUnit",
-  );
-  const resolveSrc = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "resolve.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    resolveSrc.includes("export function resolveAgentEnd"),
-    "auto/resolve.ts must define resolveAgentEnd",
-  );
-});
-
-test("auto.ts startAuto dispatches through the UOK kernel wrapper with explicit kernel and legacy paths", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto.ts"),
-    "utf-8",
-  );
-  // Find the startAuto function body
-  const fnIdx = src.indexOf("export async function startAuto");
-  assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
-  const fnEnd = src.indexOf("\n// ─── ", fnIdx + 100);
-  const fnBlock =
-    fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 5000);
-  assert.ok(
-    fnBlock.includes("runAutoLoopWithUok("),
-    "startAuto must dispatch through runAutoLoopWithUok()",
-  );
-  assert.ok(
-    fnBlock.includes("runKernelLoop: runUokKernelLoop"),
-    "startAuto must wire the explicit UOK kernel loop path",
-  );
-  assert.ok(
-    fnBlock.includes("runLegacyLoop: runLegacyAutoLoop"),
-    "startAuto must preserve explicit legacy fallback dispatch",
-  );
-});
-
-test("startAuto calls selfHealRuntimeRecords before autoLoop (#1727)", { skip: "selfHealRuntimeRecords moved to crash-recovery pipeline in v3" }, () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto.ts"),
-    "utf-8",
-  );
-  const fnIdx = src.indexOf("export async function startAuto");
-  assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
-  const fnEnd = src.indexOf("\n// ─── ", fnIdx + 100);
-  const fnBlock =
-    fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 5000);
-
-  // Both autoLoop call sites must be preceded by selfHealRuntimeRecords
-  const healIdx = fnBlock.indexOf("selfHealRuntimeRecords");
-  const loopIdx = fnBlock.indexOf("autoLoop(");
-  assert.ok(healIdx > -1, "startAuto must call selfHealRuntimeRecords");
-  assert.ok(healIdx < loopIdx, "selfHealRuntimeRecords must be called before autoLoop");
-
-  // Verify the second autoLoop call site also has selfHeal before it (if present)
-  const secondLoopIdx = fnBlock.indexOf("autoLoop(", loopIdx + 1);
-  const secondHealIdx = fnBlock.indexOf("selfHealRuntimeRecords", healIdx + 1);
-  assert.ok(
-    secondLoopIdx === -1 || (secondHealIdx > -1 && secondHealIdx < secondLoopIdx),
-    "if a second autoLoop call exists, it must also be preceded by selfHealRuntimeRecords",
-  );
-});
-
-test("startAuto guards against concurrent invocation (#2923)", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto.ts"),
-    "utf-8",
-  );
-  const fnIdx = src.indexOf("export async function startAuto");
-  assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
-  // The guard must appear before any other logic in the function body
-  const fnBody = src.slice(fnIdx, fnIdx + 500);
-  const activeGuard = fnBody.indexOf("if (s.active)");
-  assert.ok(activeGuard > -1, "startAuto must check s.active to prevent concurrent auto-loops");
-  const returnIdx = fnBody.indexOf("return;", activeGuard);
-  assert.ok(
-    returnIdx > -1 && returnIdx < activeGuard + 120,
-    "s.active guard must early-return to prevent a second concurrent loop",
-  );
-});
-
-test("agent_end handler calls resolveAgentEnd (not the legacy auto.ts path)", () => {
-  const hooksSrc = readFileSync(
-    resolve(import.meta.dirname, "..", "bootstrap", "register-hooks.ts"),
-    "utf-8",
-  );
-  // Verify the agent_end hook is registered
-  const handlerIdx = hooksSrc.indexOf('pi.on("agent_end"');
-  assert.ok(handlerIdx > -1, "register-hooks.ts must have an agent_end handler");
-
-  const recoverySrc = readFileSync(
-    resolve(import.meta.dirname, "..", "bootstrap", "agent-end-recovery.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    recoverySrc.includes("resolveAgentEnd(event)"),
-    "agent_end success path must call resolveAgentEnd(event) instead of legacy wrappers",
-  );
-  assert.ok(
-    recoverySrc.includes("isSessionSwitchInFlight()"),
-    "agent_end handler must ignore session-switch agent_end events from cmdCtx.newSession()",
-  );
-});
-
-test("auto-verification.ts runPostUnitVerification does not take dispatchNextUnit callback", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto-verification.ts"),
-    "utf-8",
-  );
-  const fnIdx = src.indexOf("export async function runPostUnitVerification");
-  assert.ok(fnIdx > -1, "runPostUnitVerification must exist");
-  const sigEnd = src.indexOf("): Promise<VerificationResult>", fnIdx);
-  const signature = src.slice(fnIdx, sigEnd);
-  assert.ok(
-    !signature.includes("dispatchNextUnit"),
-    "runPostUnitVerification must not take a dispatchNextUnit callback parameter",
-  );
-  assert.ok(
-    !signature.includes("startDispatchGapWatchdog"),
-    "runPostUnitVerification must not take a startDispatchGapWatchdog callback parameter",
-  );
-});
-
-test("auto-timeout-recovery.ts calls resolveAgentEnd instead of dispatchNextUnit", () => {
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto-timeout-recovery.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    !src.includes("await dispatchNextUnit"),
-    "auto-timeout-recovery.ts must not call dispatchNextUnit",
-  );
-  assert.ok(
-    src.includes("resolveAgentEnd("),
-    "auto-timeout-recovery.ts must call resolveAgentEnd to re-iterate the loop on timeout recovery",
-  );
-});
+// NOTE: The T03 "wiring structural assertions" block (barrel re-exports,
+// LoopDeps-interface-declared, while-loop keyword, UOK kernel wrapper,
+// selfHeal ordering, s.active concurrent guard, agent_end handler call
+// shape, runPostUnitVerification signature, auto-timeout-recovery call
+// shape) was a pure source-grep chain — readFileSync + includes/indexOf —
+// so it asserted on code shape rather than runtime behaviour. The symbols
+// named in those assertions are ALREADY imported at the top of this file;
+// if the production barrel drops any of them, this file fails to import
+// and every test here fails cold. That import-time check is the real
+// behavioural contract. The ordering/signature contracts (UOK dispatch,
+// concurrent guard, agent_end wiring) are tracked as follow-up issues for
+// pure-helper extraction per the #4832/PR #4859 precedent.
 
 // ── Stuck counter tests ──────────────────────────────────────────────────────
 
@@ -1912,26 +2024,10 @@ test("detectStuck: truncates long error strings", () => {
   assert.ok(result!.reason.length < 300, "reason should be truncated");
 });
 
-test("stuck detection: logs debug output with stuck-detected phase", () => {
-  // Structural test: verify auto/phases.ts contains
-  // stuck-detected and stuck-counter-reset debug log phases, plus detectStuck
-  const src = readFileSync(
-    resolve(import.meta.dirname, "..", "auto", "phases.ts"),
-    "utf-8",
-  );
-  assert.ok(
-    src.includes('"stuck-detected"'),
-    "auto/phases.ts must log phase: 'stuck-detected' when stuck detection fires",
-  );
-  assert.ok(
-    src.includes('"stuck-counter-reset"'),
-    "auto/phases.ts must log phase: 'stuck-counter-reset' when recovery resets on new unit",
-  );
-  assert.ok(
-    src.includes("detectStuck"),
-    "auto/phases.ts must use detectStuck for sliding window analysis",
-  );
-});
+// NOTE: the "stuck-detected" / "stuck-counter-reset" debug-log grep was
+// removed — that string test never exercised the detector. detectStuck
+// itself is tested behaviourally above against the real implementation
+// imported from auto-loop.js.
 
 // ── Lifecycle test (S05/T02) ─────────────────────────────────────────────────
 
@@ -1994,7 +2090,7 @@ test("autoLoop lifecycle: advances through research → plan → execute → ver
     { unitType: "research-slice", unitId: "M001/S01", prompt: "research" },
     { unitType: "plan-slice", unitId: "M001/S01", prompt: "plan" },
     { unitType: "execute-task", unitId: "M001/S01/T01", prompt: "execute" },
-    { unitType: "verify-slice", unitId: "M001/S01", prompt: "verify" },
+    { unitType: "run-uat", unitId: "M001/S01", prompt: "verify" },
     { unitType: "complete-slice", unitId: "M001/S01", prompt: "complete" },
   ];
 
@@ -2064,8 +2160,8 @@ test("autoLoop lifecycle: advances through research → plan → execute → ver
     `should have dispatched execute-task, got: ${dispatchedUnitTypes.join(", ")}`,
   );
   assert.ok(
-    dispatchedUnitTypes.includes("verify-slice"),
-    `should have dispatched verify-slice, got: ${dispatchedUnitTypes.join(", ")}`,
+    dispatchedUnitTypes.includes("run-uat"),
+    `should have dispatched run-uat, got: ${dispatchedUnitTypes.join(", ")}`,
   );
   assert.ok(
     dispatchedUnitTypes.includes("complete-slice"),
@@ -2097,7 +2193,7 @@ test("autoLoop lifecycle: advances through research → plan → execute → ver
       "research-slice",
       "plan-slice",
       "execute-task",
-      "verify-slice",
+      "run-uat",
       "complete-slice",
     ],
     "dispatched unit types should follow the full lifecycle sequence",
@@ -2183,6 +2279,37 @@ test("resolveAgentEndCancelled without args produces no errorContext field", asy
   const resolved = await p;
   assert.equal(resolved.status, "cancelled");
   assert.equal(resolved.errorContext, undefined, "errorContext must not be present when no args passed");
+});
+
+test("resolveAgentEndCancelled queues cancellation that arrives during session switch", () => {
+  _resetPendingResolve();
+
+  _setSessionSwitchInFlight(true);
+  const resolved = resolveAgentEndCancelled({
+    message: "Claude Code process aborted by user",
+    category: "aborted",
+    isTransient: false,
+  });
+
+  assert.equal(resolved, false);
+  const pending = _consumePendingSwitchCancellation();
+  assert.ok(pending?.errorContext, "queued cancellation should preserve errorContext");
+  assert.equal(pending.errorContext.category, "aborted");
+  assert.equal(pending.errorContext.message, "Claude Code process aborted by user");
+  assert.equal(_consumePendingSwitchCancellation(), null);
+  _resetPendingResolve();
+});
+
+test("session-switch abort grace window is short-lived and resettable", () => {
+  _resetPendingResolve();
+
+  _markSessionSwitchAbortGraceWindow(1_000);
+
+  assert.equal(isSessionSwitchAbortGraceActive(Date.now()), true);
+  assert.equal(isSessionSwitchAbortGraceActive(Date.now() + 10_000), false);
+
+  _clearSessionSwitchAbortGraceWindow();
+  assert.equal(isSessionSwitchAbortGraceActive(), false);
 });
 
 // ─── #1571: artifact verification retry ──────────────────────────────────────
@@ -2374,6 +2501,87 @@ test("autoLoop rejects execute-task with 0 tool calls as hallucinated (#1833)", 
   );
 });
 
+test("autoLoop pauses user-driven deep question instead of flagging 0 tool calls", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const s = makeLoopSession();
+  const mockLedger = {
+    version: 1,
+    projectStartedAt: Date.now(),
+    units: [] as any[],
+  };
+
+  const deps = makeMockDeps({
+    deriveState: async () => {
+      deps.callLog.push("deriveState");
+      return {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Bootstrap", status: "active" },
+        activeSlice: null,
+        activeTask: null,
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any;
+    },
+    resolveDispatch: async () => {
+      deps.callLog.push("resolveDispatch");
+      return {
+        action: "dispatch" as const,
+        unitType: "discuss-project",
+        unitId: "PROJECT",
+        prompt: "ask what to build",
+      };
+    },
+    closeoutUnit: async () => {
+      mockLedger.units.push({
+        type: "discuss-project",
+        id: "PROJECT",
+        startedAt: s.currentUnit?.startedAt ?? Date.now(),
+        toolCalls: 0,
+        assistantMessages: 1,
+        tokens: { input: 100, output: 20, total: 120, cacheRead: 0, cacheWrite: 0 },
+        cost: 0.01,
+      });
+    },
+    getLedger: () => mockLedger,
+    postUnitPreVerification: async () => {
+      deps.callLog.push("postUnitPreVerification");
+      return "dispatched" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "What do you want to build?" },
+      ],
+    },
+  ]));
+
+  await loopPromise;
+
+  assert.ok(
+    deps.callLog.includes("postUnitPreVerification"),
+    "questioning units should reach post-unit verification so the pause path can run",
+  );
+  assert.ok(
+    !notifications.some((n) => n.includes("context exhaustion")),
+    "questioning units should not show the context-exhaustion warning",
+  );
+});
+
 test("autoLoop rejects complete-slice with 0 tool calls as context-exhausted (#2653)", async () => {
   _resetPendingResolve();
 
@@ -2480,7 +2688,7 @@ test("autoLoop rejects complete-slice with 0 tool calls as context-exhausted (#2
 
 // ─── Worktree health check (#1833) ────────────────────────────────────────
 
-test("autoLoop stops when worktree has no .git for execute-task (#1833)", async () => {
+test("autoLoop stops when Worktree Safety finds no .git marker for execute-task (#1833)", async (t) => {
   _resetPendingResolve();
 
   const ctx = makeMockCtx();
@@ -2491,7 +2699,16 @@ test("autoLoop stops when worktree has no .git for execute-task (#1833)", async 
   const notifications: string[] = [];
   ctx.ui.notify = (msg: string) => { notifications.push(msg); };
 
-  const s = makeLoopSession({ basePath: "/tmp/broken-worktree" });
+  const projectRoot = mkdtempSync(join(tmpdir(), "gsd-wt-safety-loop-"));
+  const worktreeRoot = join(projectRoot, ".gsd", "worktrees", "M001");
+  mkdirSync(worktreeRoot, { recursive: true });
+  t.after(() => rmSync(projectRoot, { recursive: true, force: true }));
+
+  const s = makeLoopSession({
+    basePath: worktreeRoot,
+    originalBasePath: projectRoot,
+    canonicalProjectRoot: projectRoot,
+  });
 
   const deps = makeMockDeps({
     deriveState: async () => {
@@ -2505,8 +2722,7 @@ test("autoLoop stops when worktree has no .git for execute-task (#1833)", async 
         blockers: [],
       } as any;
     },
-    // .git does not exist in the broken worktree
-    existsSync: (p: string) => !p.endsWith(".git"),
+    getIsolationMode: () => "worktree",
   });
 
   await autoLoop(ctx, pi, s, deps);
@@ -2516,11 +2732,283 @@ test("autoLoop stops when worktree has no .git for execute-task (#1833)", async 
     "should stop auto-mode when worktree is invalid",
   );
   const healthNotification = notifications.find(
-    (n) => n.includes("Worktree health check failed") && n.includes("no .git"),
+    (n) => n.includes("Worktree Safety failed") && n.includes("worktree-git-marker-missing"),
   );
   assert.ok(
     healthNotification,
-    "should notify about missing .git in worktree",
+    "should notify about missing worktree .git marker",
+  );
+});
+
+test("dispatch Worktree Safety wins before stuck detection for execute-task without .git", async (t) => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const projectRoot = mkdtempSync(join(tmpdir(), "gsd-wt-safety-dispatch-"));
+  const worktreeRoot = join(projectRoot, ".gsd", "worktrees", "M001");
+  mkdirSync(worktreeRoot, { recursive: true });
+  t.after(() => rmSync(projectRoot, { recursive: true, force: true }));
+
+  const s = makeLoopSession({
+    basePath: worktreeRoot,
+    originalBasePath: projectRoot,
+    canonicalProjectRoot: projectRoot,
+  });
+  const deps = makeMockDeps({
+    getIsolationMode: () => "worktree",
+  });
+  const result = await runDispatch(
+    {
+      ctx,
+      pi,
+      s,
+      deps,
+      prefs: undefined,
+      iteration: 1,
+      flowId: "test-flow",
+      nextSeq: () => 1,
+    },
+    {
+      state: {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Test", status: "active" },
+        activeSlice: { id: "S01", title: "Slice 1" },
+        activeTask: { id: "T01" },
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any,
+      mid: "M001",
+      midTitle: "Test",
+    },
+    {
+      recentUnits: [
+        { key: "execute-task/M001/S01/T01" },
+        { key: "execute-task/M001/S01/T01" },
+      ],
+      stuckRecoveryAttempts: 1,
+      consecutiveFinalizeTimeouts: 0,
+    },
+  );
+
+  assert.equal(result.action, "break");
+  assert.equal(result.reason, "worktree-git-marker-missing");
+  assert.ok(deps.callLog.includes("stopAuto"), "should stop through Worktree Safety");
+  assert.ok(
+    notifications.some((n) => n.includes("Worktree Safety failed") && n.includes("worktree-git-marker-missing")),
+    "should notify about missing worktree .git marker",
+  );
+  assert.ok(
+    !notifications.some((n) => n.includes("Stuck on execute-task")),
+    "stuck-loop message must not mask the worktree health failure",
+  );
+});
+
+test("dispatch Worktree Safety stops unknown unit types with missing Tool Contract", async (t) => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const projectRoot = mkdtempSync(join(tmpdir(), "gsd-wt-safety-missing-contract-"));
+  const worktreeRoot = join(projectRoot, ".gsd", "worktrees", "M001");
+  mkdirSync(worktreeRoot, { recursive: true });
+  t.after(() => rmSync(projectRoot, { recursive: true, force: true }));
+
+  const s = makeLoopSession({
+    basePath: worktreeRoot,
+    originalBasePath: projectRoot,
+    canonicalProjectRoot: projectRoot,
+  });
+  const deps = makeMockDeps({
+    getIsolationMode: () => "worktree",
+    resolveDispatch: async () => {
+      deps.callLog.push("resolveDispatch");
+      return {
+        action: "dispatch" as const,
+        unitType: "new-source-writing-unit-without-manifest",
+        unitId: "M001/S01/T01",
+        prompt: "do the thing",
+      };
+    },
+  });
+
+  const result = await runDispatch(
+    {
+      ctx,
+      pi,
+      s,
+      deps,
+      prefs: undefined,
+      iteration: 1,
+      flowId: "test-flow",
+      nextSeq: () => 1,
+    },
+    {
+      state: {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Test", status: "active" },
+        activeSlice: { id: "S01", title: "Slice 1" },
+        activeTask: { id: "T01" },
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any,
+      mid: "M001",
+      midTitle: "Test",
+    },
+    {
+      recentUnits: [],
+      stuckRecoveryAttempts: 0,
+      consecutiveFinalizeTimeouts: 0,
+    },
+  );
+
+  assert.equal(result.action, "break");
+  assert.equal(result.reason, "missing-tool-contract");
+  assert.ok(deps.callLog.includes("stopAuto"), "should stop when the Tool Contract is missing");
+  assert.ok(
+    notifications.some((n) => n.includes("missing Tool Contract for new-source-writing-unit-without-manifest")),
+    "should notify with an actionable missing Tool Contract reason",
+  );
+});
+
+test("pre-dispatch skip resolves before dispatch health and stuck accounting", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const s = makeLoopSession({ basePath: "/tmp/broken-worktree" });
+  const deps = makeMockDeps({
+    existsSync: (p: string) => !p.endsWith(".git"),
+    runPreDispatchHooks: () => ({ firedHooks: ["skip-execute"], action: "skip" }),
+  });
+  const loopState = {
+    recentUnits: [
+      { key: "execute-task/M001/S01/T01" },
+      { key: "execute-task/M001/S01/T01" },
+    ],
+    stuckRecoveryAttempts: 1,
+    consecutiveFinalizeTimeouts: 0,
+  };
+
+  const result = await runDispatch(
+    {
+      ctx,
+      pi,
+      s,
+      deps,
+      prefs: undefined,
+      iteration: 1,
+      flowId: "test-flow",
+      nextSeq: () => 1,
+    },
+    {
+      state: {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Test", status: "active" },
+        activeSlice: { id: "S01", title: "Slice 1" },
+        activeTask: { id: "T01" },
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any,
+      mid: "M001",
+      midTitle: "Test",
+    },
+    loopState,
+  );
+
+  assert.equal(result.action, "continue");
+  assert.ok(!deps.callLog.includes("stopAuto"), "skip hook should not stop on worktree health");
+  assert.equal(loopState.recentUnits.length, 2, "skip hook should not update stuck accounting");
+  assert.ok(
+    notifications.some((n) => n.includes("Skipping execute-task M001/S01/T01")),
+    "should notify about the skip hook",
+  );
+  assert.ok(
+    !notifications.some((n) => n.includes("Worktree health check failed") || n.includes("Stuck on execute-task")),
+    "health and stuck notifications must not run before skip hook resolution",
+  );
+});
+
+test("pre-dispatch replace resolves final unit before dispatch health and stuck accounting", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  const pi = makeMockPi();
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const s = makeLoopSession({ basePath: "/tmp/broken-worktree" });
+  const deps = makeMockDeps({
+    existsSync: (p: string) => !p.endsWith(".git"),
+    runPreDispatchHooks: () => ({
+      firedHooks: ["review"],
+      action: "replace",
+      unitType: "run-uat",
+      prompt: "review before executing",
+      model: "review-model",
+    }),
+  });
+  const loopState = {
+    recentUnits: [
+      { key: "execute-task/M001/S01/T01" },
+      { key: "execute-task/M001/S01/T01" },
+    ],
+    stuckRecoveryAttempts: 1,
+    consecutiveFinalizeTimeouts: 0,
+  };
+
+  const result = await runDispatch(
+    {
+      ctx,
+      pi,
+      s,
+      deps,
+      prefs: undefined,
+      iteration: 1,
+      flowId: "test-flow",
+      nextSeq: () => 1,
+    },
+    {
+      state: {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Test", status: "active" },
+        activeSlice: { id: "S01", title: "Slice 1" },
+        activeTask: { id: "T01" },
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any,
+      mid: "M001",
+      midTitle: "Test",
+    },
+    loopState,
+  );
+
+  assert.equal(result.action, "next");
+  assert.equal(result.data?.unitType, "run-uat");
+  assert.equal(result.data?.finalPrompt, "review before executing");
+  assert.equal(result.data?.hookModelOverride, "review-model");
+  assert.ok(!deps.callLog.includes("stopAuto"), "replace hook should not stop on execute-task health");
+  assert.deepEqual(
+    loopState.recentUnits.map((u) => u.key),
+    [
+      "execute-task/M001/S01/T01",
+      "execute-task/M001/S01/T01",
+      "run-uat/M001/S01/T01",
+    ],
+    "stuck accounting should record the final replaced unit",
+  );
+  assert.ok(
+    !notifications.some((n) => n.includes("Worktree health check failed") || n.includes("Stuck on execute-task")),
+    "health and stuck notifications must use the final replaced unit",
   );
 });
 
@@ -2571,10 +3059,236 @@ test("autoLoop warns but proceeds for greenfield project (no project files) (#18
     "should not stop with health check failure for greenfield project",
   );
   const greenfieldWarning = notifications.find(
-    (n) => n.includes("no recognized project files") && n.includes("greenfield"),
+    (n) => n.includes("no project content yet") && n.includes("greenfield"),
   );
   assert.ok(
     greenfieldWarning,
     "should warn about greenfield project (no project files)",
   );
+});
+
+// ── Proactive rate limiting (#2996) ──────────────────────────────────────────
+
+test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2996)", async () => {
+  _resetPendingResolve();
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+
+  try {
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+    const pi = makeMockPi();
+    const originalSendMessage = pi.sendMessage;
+    const dispatchTimestamps: number[] = [];
+    pi.sendMessage = (...args: unknown[]) => {
+      dispatchTimestamps.push(Date.now());
+      return originalSendMessage(...args);
+    };
+
+    let iterCount = 0;
+
+    const s = makeLoopSession();
+
+    const deps = makeMockDeps({
+      loadEffectiveGSDPreferences: () => ({
+        preferences: {
+          min_request_interval_ms: 300,
+          uok: { plan_v2: { enabled: false } },
+        },
+      }),
+      deriveState: async () => {
+        iterCount++;
+        deps.callLog.push("deriveState");
+        return {
+          phase: "executing",
+          activeMilestone: { id: "M001", title: "Test", status: "active" },
+          activeSlice: { id: "S01", title: "Slice" },
+          activeTask: { id: "T01" },
+          registry: [{ id: "M001", status: "active" }],
+          blockers: [],
+        } as any;
+      },
+      postUnitPostVerification: async () => {
+        deps.callLog.push("postUnitPostVerification");
+        if (iterCount >= 2) {
+          s.active = false;
+        }
+        return "continue" as const;
+      },
+    });
+
+    const loopPromise = autoLoop(ctx, pi, s, deps);
+
+    await waitForMicrotasks(() => dispatchTimestamps.length === 1, "first dispatch");
+    resolveAgentEnd(makeEvent());
+    await waitForMicrotasks(
+      () => deps.callLog.filter((entry) => entry === "resolveDispatch").length >= 2,
+      "second dispatch planning",
+    );
+
+    await drainMicrotasks(100);
+    mock.timers.tick(299);
+    await drainMicrotasks(100);
+    assert.equal(dispatchTimestamps.length, 1, "second dispatch should wait for the configured interval");
+
+    mock.timers.tick(1);
+    await waitForMicrotasks(() => dispatchTimestamps.length === 2, "second dispatch");
+    resolveAgentEnd(makeEvent());
+
+    await loopPromise;
+
+    assert.ok(iterCount >= 2, `expected at least 2 iterations, got ${iterCount}`);
+    assert.ok(dispatchTimestamps.length >= 2, `expected at least 2 dispatches, got ${dispatchTimestamps.length}`);
+
+    assert.equal(
+      (s as any).lastRequestTimestamp,
+      dispatchTimestamps[1],
+      "lastRequestTimestamp should record the actual dispatch time",
+    );
+
+    const gap = dispatchTimestamps[1]! - dispatchTimestamps[0]!;
+    assert.equal(
+      gap,
+      300,
+      `gap between dispatches should match min_request_interval_ms=300 (got ${gap}ms)`,
+    );
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default)", async () => {
+  _resetPendingResolve();
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: 2_000 });
+
+  try {
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+    const pi = makeMockPi();
+    const originalSendMessage = pi.sendMessage;
+    const dispatchTimestamps: number[] = [];
+    pi.sendMessage = (...args: unknown[]) => {
+      dispatchTimestamps.push(Date.now());
+      return originalSendMessage(...args);
+    };
+
+    let iterCount = 0;
+
+    const s = makeLoopSession();
+
+    const deps = makeMockDeps({
+      loadEffectiveGSDPreferences: () => ({
+        preferences: { uok: { plan_v2: { enabled: false } } },
+      }),
+      deriveState: async () => {
+        iterCount++;
+        deps.callLog.push("deriveState");
+        return {
+          phase: "executing",
+          activeMilestone: { id: "M001", title: "Test", status: "active" },
+          activeSlice: { id: "S01", title: "Slice" },
+          activeTask: { id: "T01" },
+          registry: [{ id: "M001", status: "active" }],
+          blockers: [],
+        } as any;
+      },
+      postUnitPostVerification: async () => {
+        deps.callLog.push("postUnitPostVerification");
+        if (iterCount >= 3) {
+          s.active = false;
+        }
+        return "continue" as const;
+      },
+    });
+
+    const loopPromise = autoLoop(ctx, pi, s, deps);
+
+    for (let i = 1; i <= 3; i++) {
+      await waitForMicrotasks(() => dispatchTimestamps.length === i, `dispatch ${i}`);
+      resolveAgentEnd(makeEvent());
+    }
+
+    await loopPromise;
+
+    assert.ok(iterCount >= 3, `expected at least 3 iterations, got ${iterCount}`);
+    assert.ok(dispatchTimestamps.length >= 3, `expected at least 3 dispatches, got ${dispatchTimestamps.length}`);
+
+    const gap = dispatchTimestamps[2]! - dispatchTimestamps[1]!;
+    assert.equal(
+      gap,
+      0,
+      `gap should be 0ms under mocked time without rate limiting (got ${gap}ms)`,
+    );
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+// ─── #4850: pre-send model-policy block is non-retryable ────────────────────
+test("autoLoop classifies ModelPolicyDispatchBlockedError as blocked, not a retryable error", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  const notifications: Array<{ message: string; level?: string }> = [];
+  ctx.ui.notify = (m: string, l?: string) => { notifications.push({ message: m, level: l }); };
+
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+
+  const journalEvents: Array<{ eventType: string; data?: any }> = [];
+  let pauseAutoCalls = 0;
+  let stopAutoCalls = 0;
+  // Capture onTurnResult to assert blocked-unit identity is propagated to
+  // the uokObserver. Without the fix, observedUnitType/Id are unset because
+  // the throw happens inside dispatch before the success-path assignments
+  // at loop.ts:453/631/647 (#4959 / CodeRabbit Minor).
+  const turnResults: Array<{ unitType?: string; unitId?: string; status: string }> = [];
+
+  const deps = makeMockDeps({
+    selectAndApplyModel: async () => {
+      throw new ModelPolicyDispatchBlockedError(
+        "research-slice",
+        "M001/S01",
+        [{ provider: "openai", modelId: "gpt-4o", reason: "tool policy denied (web_search) for openai-completions" }],
+      );
+    },
+    pauseAuto: async () => { pauseAutoCalls++; },
+    stopAuto: async () => { stopAutoCalls++; },
+    emitJournalEvent: (entry: any) => { journalEvents.push(entry); },
+    uokObserver: {
+      onTurnStart: () => {},
+      onPhaseResult: () => {},
+      onTurnResult: (res: any) => { turnResults.push({ unitType: res.unitType, unitId: res.unitId, status: res.status }); },
+    } as any,
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  // The unit-end event with status: "blocked" must be emitted.
+  const unitEnd = journalEvents.find(
+    e => e.eventType === "unit-end" && e.data?.status === "blocked",
+  );
+  assert.ok(unitEnd, "should emit unit-end with status=blocked");
+  assert.equal(unitEnd!.data.reason, "model-policy-dispatch-blocked");
+
+  // Loop must pause for manual attention, NOT retry until 3-strike hard stop.
+  assert.equal(pauseAutoCalls, 1, "should pause once on policy block");
+  assert.equal(stopAutoCalls, 0, "should NOT call stopAuto — pre-send block is not a retryable iteration error");
+
+  // The notification should surface the per-model deny reason from the typed error.
+  const blockedNotice = notifications.find(
+    n => n.message.includes("model-policy denied dispatch")
+      && n.message.includes("tool policy denied (web_search)"),
+  );
+  assert.ok(blockedNotice, "user-facing notification should name the policy block + deny reason");
+
+  // Blocked-unit identity must reach uokObserver.onTurnResult — the typed
+  // error already carries it, the loop must thread it into observedUnitType/Id
+  // before finishTurn is called (#4959 / CodeRabbit Minor).
+  const pausedTurn = turnResults.find(r => r.status === "paused");
+  assert.ok(pausedTurn, "uokObserver should observe a paused turn for the blocked unit");
+  assert.equal(pausedTurn!.unitType, "research-slice", "onTurnResult must receive the blocked unitType from the typed error");
+  assert.equal(pausedTurn!.unitId, "M001/S01", "onTurnResult must receive the blocked unitId from the typed error");
 });

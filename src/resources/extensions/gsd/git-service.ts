@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Git operations, commit-message formatting, and turn git actions.
 /**
  * GSD Git Service
  *
@@ -8,12 +10,13 @@
  * paths, commit type inference, and the runGit shell helper.
  */
 
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { gsdRoot } from "./paths.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { logWarning } from "./workflow-logger.js";
 
 
 import {
@@ -38,6 +41,7 @@ import {
 } from "./native-git-bridge.js";
 import { GSDError, GSD_MERGE_CONFLICT, GSD_GIT_ERROR } from "./errors.js";
 import { getErrorMessage } from "./error-utils.js";
+import { isInfrastructureError } from "./auto/infra-errors.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -85,6 +89,22 @@ export interface GitPreferences {
    *  for forensic inspection.
    */
   absorb_snapshot_commits?: boolean;
+  /** #4765 — when to collapse worktree commits back to main.
+   *  - "milestone" (default): existing behavior — squash-merge happens once
+   *    at milestone completion or transition.
+   *  - "slice": squash-merge each slice's commits to main as soon as the
+   *    slice passes validation. Shrinks the orphan window from
+   *    milestone-size to slice-size and surfaces merge conflicts per slice
+   *    rather than all at once at milestone end.
+   */
+  collapse_cadence?: "milestone" | "slice";
+  /** #4765 — when `collapse_cadence: "slice"`, optionally re-squash the per-
+   *  slice commits on main into one milestone commit at milestone completion.
+   *  Preserves the "one commit per milestone in main" history shape that
+   *  `collapse_cadence: "milestone"` produces today.
+   *  Default: true when collapse_cadence is "slice", ignored otherwise.
+   */
+  milestone_resquash?: boolean;
 }
 
 export const VALID_BRANCH_NAME = /^[a-zA-Z0-9_\-\/.]+$/;
@@ -111,6 +131,11 @@ export interface TurnGitActionResult {
 export interface TaskCommitContext {
   taskId: string;
   taskTitle: string;
+  milestoneId?: string;
+  milestoneTitle?: string;
+  sliceId?: string;
+  sliceTitle?: string;
+  taskDisplayId?: string;
   /** The one-liner from the task summary (e.g. "Added retry-aware worker status logging") */
   oneLiner?: string;
   /** Files modified by this task (from task summary frontmatter) */
@@ -130,7 +155,7 @@ export interface TaskCommitContext {
  * what was actually built), falling back to the task title (what was planned).
  */
 export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
-  const description = ctx.oneLiner || ctx.taskTitle;
+  const description = sanitizeCommitSubjectDescription(ctx.oneLiner || ctx.taskTitle);
   const type = inferCommitType(ctx.taskTitle, ctx.oneLiner);
 
   // Truncate description to ~72 chars for subject line (full budget without scope)
@@ -152,6 +177,11 @@ export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
     bodyParts.push(fileLines);
   }
 
+  const contextLines = buildTaskCommitContextLines(ctx);
+  if (contextLines.length > 0) {
+    bodyParts.push(`GSD context:\n${contextLines.join("\n")}`);
+  }
+
   // Trailers: GSD-Task first, then Resolves
   bodyParts.push(`GSD-Task: ${ctx.taskId}`);
 
@@ -160,6 +190,83 @@ export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
   }
 
   return `${subject}\n\n${bodyParts.join("\n\n")}`;
+}
+
+function buildTaskCommitContextLines(ctx: TaskCommitContext): string[] {
+  const lines: string[] = [];
+  const milestone = formatNamedContext(ctx.milestoneId, ctx.milestoneTitle);
+  const slice = formatNamedContext(ctx.sliceId, ctx.sliceTitle);
+  const taskId = ctx.taskDisplayId ?? ctx.taskId.split("/").pop();
+  const task = formatNamedContext(taskId, ctx.taskTitle);
+
+  if (milestone) lines.push(`- Milestone: ${milestone}`);
+  if (slice) lines.push(`- Slice: ${slice}`);
+  if (task) lines.push(`- Task: ${task}`);
+  return lines;
+}
+
+function formatNamedContext(id: string | undefined, title: string | undefined): string | null {
+  const cleanId = id?.trim();
+  const cleanTitle = title?.trim();
+  if (!cleanId && !cleanTitle) return null;
+  if (!cleanId) return cleanTitle ?? null;
+  if (!cleanTitle || cleanTitle === cleanId) return cleanId;
+  return `${cleanId} - ${cleanTitle}`;
+}
+
+function sanitizeCommitSubjectDescription(value: string): string {
+  const cleaned = value
+    .replace(/[\x00-\x1F\x7F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "update task";
+}
+
+function normalizeRepoRelativePath(basePath: string, filePath: string): string | null {
+  const trimmed = filePath.trim();
+  if (!trimmed || trimmed.includes("\0")) return null;
+
+  const relPath = isAbsolute(trimmed)
+    ? relative(basePath, trimmed)
+    : normalize(trimmed);
+  if (!relPath || relPath === "." || isAbsolute(relPath) || relPath.startsWith(`..${sep}`) || relPath === "..") {
+    return null;
+  }
+
+  const resolved = resolve(basePath, relPath);
+  const relFromBase = relative(basePath, resolved);
+  if (!relFromBase || relFromBase === "." || relFromBase.startsWith("..") || isAbsolute(relFromBase)) {
+    return null;
+  }
+
+  return relFromBase;
+}
+
+function pathspecToRegex(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`);
+}
+
+function isExcludedScopedPath(path: string, exclusions: readonly string[]): boolean {
+  const normalizedPath = path.replace(/\\/g, "/");
+  for (const exclusion of exclusions) {
+    const normalizedExclusion = exclusion.replace(/^:!/, "").replace(/\\/g, "/");
+    if (!normalizedExclusion) continue;
+    if (normalizedExclusion.endsWith("/")) {
+      if (normalizedPath === normalizedExclusion.slice(0, -1) || normalizedPath.startsWith(normalizedExclusion)) {
+        return true;
+      }
+      continue;
+    }
+    if (normalizedExclusion.includes("*")) {
+      if (pathspecToRegex(normalizedExclusion).test(normalizedPath)) return true;
+      continue;
+    }
+    if (normalizedPath === normalizedExclusion) return true;
+  }
+  return false;
 }
 
 /**
@@ -210,6 +317,7 @@ export interface PreMergeCheckResult {
  */
 export const RUNTIME_EXCLUSION_PATHS: readonly string[] = [
   ".gsd/activity/",
+  ".gsd/audit/",
   ".gsd/forensics/",
   ".gsd/runtime/",
   ".gsd/worktrees/",
@@ -392,6 +500,111 @@ export function resolveMilestoneIntegrationBranch(
   };
 }
 
+// ─── Pre-Merge Command Tokenizer ──────────────────────────────────────────
+
+/**
+ * Tokenize a user-supplied pre-merge command string into argv form, with
+ * minimal support for double- and single-quoted strings. Designed to be
+ * sufficient for typical commands ("npm test", `npm run lint:ci`,
+ * `pnpm run tsc --noEmit`) without spawning a shell.
+ *
+ * Returns [] when the input is empty or whitespace-only.
+ * Throws when quoting is malformed.
+ *
+ * Used by GitServiceImpl.runPreMergeCheck to eliminate the shell-injection
+ * surface that running an arbitrary user string through a shell would create.
+ * (Issue #4980 HIGH-2)
+ */
+export function tokenizePreMergeCommand(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let i = 0;
+  let quote: "" | "'" | '"' = "";
+  let hasContent = false;
+
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) {
+        quote = "";
+      } else if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        current += input[i + 1];
+        i += 2;
+        continue;
+      } else {
+        current += ch;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hasContent = true;
+      i++;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (hasContent) {
+        tokens.push(current);
+        current = "";
+        hasContent = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < input.length) {
+      current += input[i + 1];
+      i += 2;
+      hasContent = true;
+      continue;
+    }
+    current += ch;
+    hasContent = true;
+    i++;
+  }
+
+  if (quote) {
+    throw new Error(`Unterminated ${quote === '"' ? "double" : "single"} quote in pre-merge command`);
+  }
+  if (hasContent) tokens.push(current);
+  return tokens;
+}
+
+function containsUnquotedShellControl(input: string): boolean {
+  let i = 0;
+  let quote: "" | "'" | '"' = "";
+
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) {
+        quote = "";
+      } else if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < input.length) {
+      i += 2;
+      continue;
+    }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "`" || ch === "$" || ch === "<" || ch === ">") {
+      return true;
+    }
+    i++;
+  }
+
+  return false;
+}
+
 // ─── Git Helper ────────────────────────────────────────────────────────────
 
 
@@ -536,6 +749,63 @@ export class GitServiceImpl {
     nativeAddAllWithExclusions(this.basePath, allExclusions);
   }
 
+  private scopedStageTaskFiles(
+    taskContext: TaskCommitContext,
+    extraExclusions: readonly string[] = [],
+  ): boolean {
+    const keyFiles = taskContext.keyFiles ?? [];
+    if (keyFiles.length === 0) return false;
+
+    const allExclusions = [...RUNTIME_EXCLUSION_PATHS, ...extraExclusions];
+    const normalized = keyFiles
+      .map(file => normalizeRepoRelativePath(this.basePath, file))
+      .filter((file): file is string => file !== null)
+      .filter(file => !isExcludedScopedPath(file, allExclusions));
+
+    // Drop entries that don't exist on disk. The LLM occasionally lists files
+    // it intended to write but didn't (or names them with wrong casing/path).
+    // Pre-`b304f738b` `git add -A` swallowed these silently; the scoped
+    // pathspec form passes each path explicitly, so a single bad entry made
+    // the whole commit fail (see #5500). Filter so valid paths still commit.
+    const missing: string[] = [];
+    const existing: string[] = [];
+    for (const path of normalized) {
+      if (existsSync(join(this.basePath, path))) {
+        existing.push(path);
+      } else {
+        missing.push(path);
+      }
+    }
+    if (missing.length > 0) {
+      logWarning(
+        "engine",
+        `scoped stage: dropping ${missing.length} non-existent keyFile(s) from task commit: ${missing.join(", ")}`,
+        { file: "git-service.ts" },
+      );
+    }
+
+    const paths = Array.from(new Set(existing));
+    if (paths.length === 0) return false;
+
+    try {
+      nativeAddPaths(this.basePath, paths);
+      return true;
+    } catch (err) {
+      // Defense-in-depth: even after existence filtering, libgit2/git can
+      // still reject paths (gitignore matches, case-only differences on
+      // case-insensitive FS, submodule boundaries). Returning false lets
+      // autoCommit fall through to smartStage so the commit still goes out
+      // — restoring the resilience the unscoped path used to provide.
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarning(
+        "engine",
+        `scoped stage failed (${msg}); falling back to smartStage`,
+        { file: "git-service.ts" },
+      );
+      return false;
+    }
+  }
+
   /** Tracks whether runtime file cleanup has run this session. */
   private _runtimeFilesCleanedUp = false;
 
@@ -575,7 +845,10 @@ export class GitServiceImpl {
     // Native path uses libgit2 (single syscall), fallback spawns git.
     if (!nativeHasChanges(this.basePath)) return null;
 
-    this.smartStage(extraExclusions);
+    const scoped = taskContext
+      ? this.scopedStageTaskFiles(taskContext, extraExclusions)
+      : false;
+    if (!scoped) this.smartStage(extraExclusions);
 
     // After smart staging, check if anything was actually staged
     // (all changes might have been runtime files that got excluded)
@@ -785,8 +1058,34 @@ export class GitServiceImpl {
       }
     }
 
+    // Tokenize and run via execFileSync (no shell). Shell metacharacters in
+    // user-supplied prefs.pre_merge_check would otherwise be interpreted as
+    // chaining/redirection (e.g. `;`, `&&`, `|`, backticks) — a privesc
+    // surface in repos with a checked-in `.gsd/PREFERENCES.md`.
+    // (Issue #4980 HIGH-2)
+    if (containsUnquotedShellControl(command)) {
+      return {
+        passed: false,
+        skipped: false,
+        command,
+        error:
+          "pre_merge_check contains shell metacharacters (;, &&, |, $, backticks, redirects). " +
+          "Put complex commands in a script file (e.g. './scripts/pre-merge.sh') and reference the script path instead.",
+      };
+    }
+
+    const tokens = tokenizePreMergeCommand(command);
+    if (tokens.length === 0) {
+      return { passed: true, skipped: true };
+    }
+
     try {
-      execSync(command, { cwd: this.basePath, stdio: "pipe", encoding: "utf-8" });
+      execFileSync(tokens[0]!, tokens.slice(1), {
+        cwd: this.basePath,
+        stdio: "pipe",
+        encoding: "utf-8",
+        env: GIT_NO_PROMPT_ENV,
+      });
       return { passed: true, skipped: false, command };
     } catch (err) {
       const msg = getErrorMessage(err);
@@ -808,7 +1107,7 @@ export function createDraftPR(
   milestoneId: string,
   title: string,
   body: string,
-  opts?: { head?: string; base?: string },
+  opts?: { head?: string; base?: string; env?: NodeJS.ProcessEnv },
 ): string | null {
   try {
     const args = [
@@ -818,7 +1117,12 @@ export function createDraftPR(
     ];
     if (opts?.head) args.push("--head", opts.head);
     if (opts?.base) args.push("--base", opts.base);
-    const result = execFileSync("gh", args, { cwd: basePath, encoding: "utf8", timeout: 30000, env: GIT_NO_PROMPT_ENV });
+    const result = execFileSync("gh", args, {
+      cwd: basePath,
+      encoding: "utf8",
+      timeout: 30000,
+      env: opts?.env ?? GIT_NO_PROMPT_ENV,
+    });
     return result.trim();
   } catch {
     return null;
@@ -841,6 +1145,17 @@ function buildTurnSnapshotLabel(unitType: string, unitId: string): string {
     .replace(/\/{2,}/g, "/")
     .replace(/-{2,}/g, "-")
     .replace(/^[-/]+|[-/]+$/g, "") || "turn";
+}
+
+export function handleTurnGitActionError(action: TurnGitActionMode, err: unknown): TurnGitActionResult {
+  if (isInfrastructureError(err)) {
+    throw err;
+  }
+  return {
+    action,
+    status: "failed",
+    error: getErrorMessage(err),
+  };
 }
 
 export function runTurnGitAction(args: {
@@ -881,11 +1196,7 @@ export function runTurnGitAction(args: {
       dirty: nativeHasChanges(args.basePath),
     };
   } catch (err) {
-    return {
-      action: args.action,
-      status: "failed",
-      error: getErrorMessage(err),
-    };
+    return handleTurnGitActionError(args.action, err);
   }
 }
 

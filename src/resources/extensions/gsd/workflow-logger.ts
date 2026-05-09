@@ -3,22 +3,29 @@
 // Captures structured entries that the auto-loop can drain after each unit
 // to surface root causes for stuck loops, silent degradation, and blocked writes.
 // Error-severity entries are persisted to .gsd/audit-log.jsonl (sanitized) for
-// post-mortem analysis. Warnings are ephemeral (stderr + buffer only) to avoid
-// log amplification from expected-control-flow catch paths.
+// post-mortem analysis. Warnings persist to notifications and remain available
+// in the in-memory buffer, but are not printed to stderr.
 //
-// Stderr policy: every logWarning/logError call writes immediately to stderr
-// for terminal visibility. This is intentional — unlike debug-logger (which is
-// opt-in and zero-overhead when disabled), workflow-logger covers operational
-// warnings/errors that should always be visible. There is no disable flag.
+// Stderr policy: logError writes immediately to stderr for terminal visibility.
+// logWarning stays out of the TUI/stdout stream and is surfaced through the
+// notification store plus the auto-loop issue buffer.
 //
 // Singleton safety: _buffer is module-level and shared across all calls within
 // a process. The auto-loop must call _resetLogs() (or drainAndSummarize()) at
 // the start of each unit to prevent log bleed between units running in the same
 // Node process.
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
+import { withFileLockSync } from "./file-lock.js";
 import { appendNotification } from "./notification-store.js";
 import { buildAuditEnvelope, emitUokAuditEvent } from "./uok/audit.js";
 import { isUnifiedAuditEnabled } from "./uok/audit-toggle.js";
@@ -58,8 +65,10 @@ export type LogComponent =
   | "memory-embeddings" // Memory layer embedding generation
   | "memory-ingest"     // Memory layer ingestion pipeline
   | "memory-backfill"   // ADR-013: decisions->memories backfill
+  | "memory-store"      // Memory CRUD layer — surfaces SQLite/store-level faults (#4967)
   | "context-mode"     // Context-mode exec sandbox and compaction snapshot
-  | "preflight";       // Clean-root preflight gate at milestone completion
+  | "preflight"        // Clean-root preflight gate at milestone completion
+  | "postUnit";     // Post-unit processing (abandon detection, overrides)
 
 export interface LogEntry {
   ts: string;
@@ -99,7 +108,8 @@ export function setStderrLoggingEnabled(enabled: boolean): boolean {
 // ─── Public API ─────────────────────────────────────────────────────────
 
 /**
- * Record a warning. Also writes to stderr for terminal visibility.
+ * Record a warning. Warnings are persisted to notifications and buffered for
+ * auto-loop issue summaries, but they are intentionally not written to stderr.
  */
 export function logWarning(
   component: LogComponent,
@@ -261,10 +271,10 @@ function _push(
     ...(context ? { context } : {}),
   };
 
-  // Always forward to stderr so terminal watchers see it (see module header for policy)
-  const prefix = severity === "error" ? "ERROR" : "WARN";
-  const ctxStr = context ? ` ${JSON.stringify(context)}` : "";
-  _writeStderr(`[gsd:${component}] ${prefix}: ${message}${ctxStr}\n`);
+  if (severity === "error") {
+    const ctxStr = context ? ` ${JSON.stringify(context)}` : "";
+    _writeStderr(`[gsd:${component}] ERROR: ${message}${ctxStr}\n`);
+  }
 
   // Persist to notification store (both warnings and errors)
   try {
@@ -307,14 +317,24 @@ function _push(
   }
 
   // Persist errors to .gsd/audit-log.jsonl so they survive context resets.
-  // Only error-severity entries are persisted — warnings are ephemeral (stderr + buffer)
-  // to avoid log amplification from expected-control-flow catch paths.
+  // Warnings are already persisted to notifications and buffered for the
+  // current auto-loop unit.
   if (_auditBasePath && severity === "error") {
     try {
       const auditDir = join(_auditBasePath, ".gsd");
       mkdirSync(auditDir, { recursive: true });
+      const auditPath = join(auditDir, "audit-log.jsonl");
       const sanitized = _sanitizeForAudit(entry);
-      appendFileSync(join(auditDir, "audit-log.jsonl"), JSON.stringify(sanitized) + "\n", "utf-8");
+      // Ensure file exists so proper-lockfile can acquire a lock against it.
+      if (!existsSync(auditPath)) closeSync(openSync(auditPath, "a"));
+      // onLocked: "skip" — never block error logging on lock contention.
+      withFileLockSync(
+        auditPath,
+        () => {
+          appendFileSync(auditPath, JSON.stringify(sanitized) + "\n", "utf-8");
+        },
+        { onLocked: "skip" },
+      );
     } catch (auditErr) {
       // Best-effort — never let audit write failures bubble up
       _writeStderr(`[gsd:audit] failed to persist log entry: ${(auditErr as Error).message}\n`);

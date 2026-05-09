@@ -14,10 +14,10 @@ import { join } from "node:path";
 import {
   transaction,
   insertAssessment,
-  deleteAssessmentByScope,
   getMilestoneSlices,
 } from "../gsd-db.js";
 import { resolveMilestonePath, clearPathCache } from "../paths.js";
+import { resolveCanonicalMilestoneRoot } from "../worktree-manager.js";
 import { saveFile, clearParseCache } from "../files.js";
 import { invalidateStateCache } from "../state.js";
 import { VALIDATION_VERDICTS, isValidMilestoneVerdict } from "../verdict-parser.js";
@@ -44,6 +44,7 @@ export interface ValidateMilestoneResult {
   milestoneId: string;
   verdict: string;
   validationPath: string;
+  stale?: boolean;
 }
 
 export interface ValidateMilestoneOptions {
@@ -100,14 +101,19 @@ export async function handleValidateMilestone(
   }
 
   // ── Resolve paths and render markdown ────────────────────────────────
+  // #4761: route through the canonical-root resolver so that when a live
+  // worktree exists for this milestone, validation reads/writes the
+  // worktree's artifacts instead of stale project-root state.
   const validationMd = renderValidationMarkdown(params);
 
+  const canonicalBase = resolveCanonicalMilestoneRoot(basePath, params.milestoneId);
+
   let validationPath: string;
-  const milestoneDir = resolveMilestonePath(basePath, params.milestoneId);
+  const milestoneDir = resolveMilestonePath(canonicalBase, params.milestoneId);
   if (milestoneDir) {
     validationPath = join(milestoneDir, `${params.milestoneId}-VALIDATION.md`);
   } else {
-    const gsdDir = join(basePath, ".gsd");
+    const gsdDir = join(canonicalBase, ".gsd");
     const manualDir = join(gsdDir, "milestones", params.milestoneId);
     validationPath = join(manualDir, `${params.milestoneId}-VALIDATION.md`);
   }
@@ -144,13 +150,14 @@ export async function handleValidateMilestone(
   });
 
   // ── Filesystem render (outside transaction) ────────────────────────────
-  // If disk render fails, roll back the DB row so state stays consistent.
+  let projectionStale = false;
   try {
     await saveFile(validationPath, validationMd);
   } catch (renderErr) {
-    logWarning("tool", `validate_milestone — disk render failed, rolling back DB row: ${(renderErr as Error).message}`);
-    deleteAssessmentByScope(params.milestoneId, 'milestone-validation');
-    return { error: `disk render failed: ${(renderErr as Error).message}` };
+    projectionStale = true;
+    logWarning("projection", `validate_milestone projection write failed for ${params.milestoneId}; DB validation remains committed`, {
+      error: (renderErr as Error).message,
+    });
   }
 
   invalidateStateCache();
@@ -196,5 +203,6 @@ export async function handleValidateMilestone(
     milestoneId: params.milestoneId,
     verdict: params.verdict,
     validationPath,
+    ...(projectionStale ? { stale: true } : {}),
   };
 }

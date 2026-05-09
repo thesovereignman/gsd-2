@@ -14,6 +14,7 @@ import {
   getTask,
   getSliceTasks,
   insertVerificationEvidence,
+  SCHEMA_VERSION,
 } from '../gsd-db.ts';
 import { handleCompleteTask } from '../tools/complete-task.ts';
 
@@ -99,19 +100,22 @@ function makeValidParams() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// complete-task: Schema v5 migration
+// complete-task: Fresh DB is migrated to the current schema version
 // ═══════════════════════════════════════════════════════════════════════════
 
-console.log('\n=== complete-task: schema v5 migration ===');
+console.log('\n=== complete-task: fresh DB migrates to current schema version ===');
 {
   const dbPath = tempDbPath();
   openDatabase(dbPath);
 
   const adapter = _getAdapter()!;
 
-  // Verify schema version is current (v22 — quality_gates DDL fix)
+  // Verify schema version matches the current source-of-truth constant.
+  // Asserting against SCHEMA_VERSION (not a hardcoded number) keeps this
+  // green across migration bumps while still catching a
+  // "fresh-DB-was-not-migrated" regression.
   const versionRow = adapter.prepare('SELECT MAX(version) as v FROM schema_version').get();
-  assertEq(versionRow?.['v'], 22, 'schema version should be 22');
+  assertEq(versionRow?.['v'], SCHEMA_VERSION, 'fresh DB should be migrated to current SCHEMA_VERSION');
 
   // Verify all 4 new tables exist
   const tables = adapter.prepare(
@@ -399,9 +403,11 @@ console.log('\n=== complete-task: handler idempotency ===');
   const r1 = await handleCompleteTask(params, basePath);
   assertTrue(!('error' in r1), 'first call should succeed');
 
-  // Verify only 1 task row
+  // Verify complete-task did not duplicate T01. S01-PLAN.md is a projection,
+  // so the remaining plan task is not imported implicitly.
   const tasks = getSliceTasks('M001', 'S01');
-  assertEq(tasks.length, 1, 'should have exactly 1 task row after first call');
+  assertEq(tasks.length, 1, 'should only have the completed DB task after first call');
+  assertEq(tasks.filter(t => t.id === 'T01').length, 1, 'should have exactly one T01 row after first call');
 
   // Second call with same params — state machine guard rejects (task is already complete)
   const r2 = await handleCompleteTask(params, basePath);
@@ -410,9 +416,10 @@ console.log('\n=== complete-task: handler idempotency ===');
     assertMatch(r2.error, /already complete/, 'error should mention already complete');
   }
 
-  // Still only 1 task row (no duplication from rejected second call)
+  // Still no duplicate rows from the rejected second call.
   const tasksAfter = getSliceTasks('M001', 'S01');
-  assertEq(tasksAfter.length, 1, 'should still have exactly 1 task row after rejected second call');
+  assertEq(tasksAfter.length, 1, 'should still only have T01 after rejected second call');
+  assertEq(tasksAfter.filter(t => t.id === 'T01').length, 1, 'should still have exactly one T01 row');
 
   cleanupDir(basePath);
   cleanup(dbPath);
@@ -439,10 +446,13 @@ console.log('\n=== complete-task: handler with missing plan file ===');
   const params = makeValidParams();
   const result = await handleCompleteTask(params, basePath);
 
-  // Should succeed even without plan file — just skip checkbox toggle
+  // Should succeed and regenerate the missing plan projection from DB.
   assertTrue(!('error' in result), 'handler should succeed without plan file');
   if (!('error' in result)) {
     assertTrue(fs.existsSync(result.summaryPath), 'summary should be written even without plan file');
+    const planPath = path.join(basePath, '.gsd', 'milestones', 'M001', 'slices', 'S01', 'S01-PLAN.md');
+    assertTrue(fs.existsSync(planPath), 'missing plan projection should be regenerated from DB');
+    assertTrue(fs.readFileSync(planPath, 'utf-8').includes('[x] **T01:'), 'regenerated plan should reflect DB task completion');
   }
 
   cleanupDir(basePath);

@@ -20,7 +20,7 @@ import {
   insertSlice,
   insertTask,
 } from '../gsd-db.ts';
-import { migrateHierarchyToDb } from '../md-importer.ts';
+import { migrateFromMarkdown, migrateHierarchyToDb } from '../md-importer.ts';
 import type { GSDState } from '../types.ts';
 
 // ─── Fixture Helpers ───────────────────────────────────────────────────────
@@ -351,9 +351,9 @@ skills_used: []
       const dbState = await deriveStateFromDb(base);
 
       assertStatesEqual(dbState, fileState, 'E-blocked');
-      // With partial-dep fallback, circular deps no longer block — fallback picks first eligible slice
-      assert.deepStrictEqual(dbState.phase, 'planning', 'E-blocked: phase is planning (fallback picks a slice)');
-      assert.ok(dbState.activeSlice !== null, 'E-blocked: activeSlice is set via fallback');
+      assert.deepStrictEqual(dbState.phase, 'blocked', 'E-blocked: phase is blocked when no slice deps are satisfied');
+      assert.deepStrictEqual(dbState.activeSlice, null, 'E-blocked: no activeSlice is selected through unmet deps');
+      assert.ok(dbState.blockers.some(b => b.includes('No slice eligible')), 'E-blocked: blocker explains no eligible slice');
 
       closeDatabase();
     } finally {
@@ -479,12 +479,13 @@ skills_used: []
 
       // Step 2: Migrate markdown to DB
       openDatabase(':memory:');
-      const counts = migrateHierarchyToDb(base);
+      const counts = migrateFromMarkdown(base);
 
       // Verify migration populated correctly
-      assert.ok(counts.milestones >= 1, 'G-roundtrip: migrated milestones');
-      assert.ok(counts.slices >= 2, 'G-roundtrip: migrated slices');
-      assert.ok(counts.tasks >= 3, 'G-roundtrip: migrated tasks');
+      assert.ok(counts.hierarchy.milestones >= 1, 'G-roundtrip: migrated milestones');
+      assert.ok(counts.hierarchy.slices >= 2, 'G-roundtrip: migrated slices');
+      assert.ok(counts.hierarchy.tasks >= 3, 'G-roundtrip: migrated tasks');
+      assert.equal(counts.requirements, 3, 'G-roundtrip: migrated requirements');
 
       // Step 3: Get DB-backed state
       invalidateStateCache();

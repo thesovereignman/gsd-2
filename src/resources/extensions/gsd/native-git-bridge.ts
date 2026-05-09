@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { GSDError, GSD_GIT_ERROR } from "./errors.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { getErrorMessage } from "./error-utils.js";
+import { isInfrastructureError } from "./auto/infra-errors.js";
 
 // Issue #453: keep auto-mode bookkeeping on the stable git CLI path unless a
 // caller explicitly opts into the native helper.
@@ -324,6 +325,20 @@ export function nativeIsRepo(basePath: string): boolean {
   }
   try {
     execFileSync("git", ["rev-parse", "--git-dir"], { cwd: basePath, stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Return true only when the repository has a reachable committed HEAD. */
+export function nativeHasCommittedHead(basePath: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd: basePath,
+      stdio: ["ignore", "ignore", "ignore"],
+      env: GIT_NO_PROMPT_ENV,
+    });
     return true;
   } catch {
     return false;
@@ -846,6 +861,10 @@ export function nativeAddAllWithExclusions(basePath: string, exclusions: readonl
     });
   } catch (err: unknown) {
     const stderr = (err as { stderr?: string })?.stderr ?? "";
+    const infraCode = isInfrastructureError(err) ?? isInfrastructureError(stderr);
+    if (infraCode) {
+      throw err;
+    }
     // git exits 1 when pathspec exclusions reference paths already covered
     // by .gitignore. The staging itself succeeds — only suppress that case.
     if (stderr.includes("ignored by one of your .gitignore files")) {
@@ -860,7 +879,8 @@ export function nativeAddAllWithExclusions(basePath: string, exclusions: readonl
       fallbackStageWithSymlinkedDotGsd(basePath);
       return;
     }
-    throw new GSDError(GSD_GIT_ERROR, `git add -A with exclusions failed in ${basePath}: ${getErrorMessage(err)}`);
+    const stderrDetail = stderr.trim() ? `; stderr: ${stderr.trim()}` : "";
+    throw new GSDError(GSD_GIT_ERROR, `git add -A with exclusions failed in ${basePath}: ${getErrorMessage(err)}${stderrDetail}`);
   }
 }
 
@@ -897,28 +917,22 @@ export function nativeResetPaths(basePath: string, paths: string[]): void {
 /**
  * Create a commit from the current index.
  * Returns the commit SHA on success, or null if nothing to commit.
- * Native: libgit2 commit create.
- * Fallback: `git commit --no-verify -F -`.
+ * Uses `git commit -F -` so normal user hooks run and commit.gpgsign is honored.
+ *
+ * The fallback intentionally does NOT use --no-verify — user pre-commit /
+ * commit-msg / prepare-commit-msg hooks must fire on every GSD-automated
+ * commit. (Issue #4980 CRIT-1)
  */
 export function nativeCommit(
   basePath: string,
   message: string,
   options?: { allowEmpty?: boolean; input?: string },
 ): string | null {
-  const native = loadNative();
-  if (native) {
-    try {
-      return native.gitCommit(basePath, message, options?.allowEmpty);
-    } catch (e) {
-      const msg = getErrorMessage(e);
-      if (msg.includes("nothing to commit")) return null;
-      throw e;
-    }
-  }
-
-  // Fallback: use git commit with stdin pipe for safe multi-line messages
+  // Use git CLI with stdin pipe for safe multi-line messages. Hooks run;
+  // commit.gpgsign honored. libgit2 commit-create bypasses hooks, so automated
+  // GSD commits intentionally stay on the CLI path even when native git is on.
   try {
-    const args = ["commit", "--no-verify", "-F", "-"];
+    const args = ["commit", "-F", "-"];
     if (options?.allowEmpty) args.push("--allow-empty");
     const result = execFileSync("git", args, {
       cwd: basePath,
@@ -1112,7 +1126,7 @@ export function nativeBranchDelete(basePath: string, branch: string, force = tru
     native.gitBranchDelete(basePath, branch, force);
     return;
   }
-  gitFileExec(basePath, ["branch", force ? "-D" : "-d", branch], true);
+  gitFileExec(basePath, ["branch", force ? "-D" : "-d", branch]);
 }
 
 /**
@@ -1169,6 +1183,33 @@ export function nativeRmForce(basePath: string, paths: string[]): void {
   }
 }
 
+function runGitWorktreeAdd(
+  basePath: string,
+  wtPath: string,
+  branch: string,
+  createBranch?: boolean,
+  startPoint?: string,
+): void {
+  if (createBranch) {
+    const branchRef = gitExec(basePath, ["show-ref", "--verify", `refs/heads/${branch}`], true);
+    if (branchRef) {
+      gitExec(basePath, ["worktree", "add", wtPath, branch]);
+      return;
+    }
+    gitExec(basePath, ["worktree", "add", "-b", branch, wtPath, startPoint ?? "HEAD"]);
+  } else {
+    gitExec(basePath, ["worktree", "add", wtPath, branch]);
+  }
+}
+
+export function assertWorktreeMaterialized(wtPath: string): void {
+  if (existsSync(join(wtPath, ".git"))) return;
+  throw new GSDError(
+    GSD_GIT_ERROR,
+    `git worktree add did not materialize a valid worktree at ${wtPath}: missing .git file`,
+  );
+}
+
 /**
  * Add a new git worktree.
  * Native: libgit2 worktree API.
@@ -1184,14 +1225,20 @@ export function nativeWorktreeAdd(
   const native = loadNative();
   if (native) {
     native.gitWorktreeAdd(basePath, wtPath, branch, createBranch, startPoint);
-    return;
+    try {
+      assertWorktreeMaterialized(wtPath);
+      return;
+    } catch {
+      rmSync(wtPath, { recursive: true, force: true });
+      gitExec(basePath, ["worktree", "prune"], true);
+      runGitWorktreeAdd(basePath, wtPath, branch, createBranch, startPoint);
+      assertWorktreeMaterialized(wtPath);
+      return;
+    }
   }
 
-  if (createBranch) {
-    gitExec(basePath, ["worktree", "add", "-b", branch, wtPath, startPoint ?? "HEAD"]);
-  } else {
-    gitExec(basePath, ["worktree", "add", wtPath, branch]);
-  }
+  runGitWorktreeAdd(basePath, wtPath, branch, createBranch, startPoint);
+  assertWorktreeMaterialized(wtPath);
 }
 
 /**

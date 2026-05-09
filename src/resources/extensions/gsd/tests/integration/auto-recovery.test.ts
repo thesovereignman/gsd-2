@@ -1,3 +1,5 @@
+// GSD Extension — Auto recovery integration tests.
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, chmodSync } from "node:fs";
@@ -401,6 +403,57 @@ test("verifyExpectedArtifact plan-slice fails for plan with no tasks (#699)", (t
   assert.equal(result, false, "should fail when plan has no task entries (empty scaffold, #699)");
 });
 
+test("verifyExpectedArtifact plan-slice trusts DB tasks over legacy plan syntax", (t) => {
+  const base = makeTmpBase();
+  t.after(() => {
+    closeDatabase();
+    cleanup(base);
+  });
+
+  openDatabase(join(base, ".gsd", "gsd.db"));
+  insertMilestone({ id: "M001", title: "Milestone", status: "active" });
+  insertSlice({ id: "S01", milestoneId: "M001", title: "Slice", status: "pending" });
+  insertTask({ id: "T01", milestoneId: "M001", sliceId: "S01", title: "First task", status: "pending" });
+  insertTask({ id: "T02", milestoneId: "M001", sliceId: "S01", title: "Second task", status: "pending" });
+
+  const sliceDir = join(base, ".gsd", "milestones", "M001", "slices", "S01");
+  const tasksDir = join(sliceDir, "tasks");
+  writeFileSync(
+    join(sliceDir, "S01-PLAN.md"),
+    "# S01: Slice\n\n## Tasks\n\nTask rows live in the DB; this projection intentionally has no legacy task syntax.\n",
+  );
+  writeFileSync(join(tasksDir, "T01-PLAN.md"), "# T01 Plan\n");
+  writeFileSync(join(tasksDir, "T02-PLAN.md"), "# T02 Plan\n");
+
+  const result = verifyExpectedArtifact("plan-slice", "M001/S01", base);
+  assert.equal(result, true, "DB task rows plus task plan files should verify plan-slice");
+});
+
+test("verifyExpectedArtifact plan-slice still fails when a DB-backed task plan file is missing", (t) => {
+  const base = makeTmpBase();
+  t.after(() => {
+    closeDatabase();
+    cleanup(base);
+  });
+
+  openDatabase(join(base, ".gsd", "gsd.db"));
+  insertMilestone({ id: "M001", title: "Milestone", status: "active" });
+  insertSlice({ id: "S01", milestoneId: "M001", title: "Slice", status: "pending" });
+  insertTask({ id: "T01", milestoneId: "M001", sliceId: "S01", title: "First task", status: "pending" });
+  insertTask({ id: "T02", milestoneId: "M001", sliceId: "S01", title: "Second task", status: "pending" });
+
+  const sliceDir = join(base, ".gsd", "milestones", "M001", "slices", "S01");
+  const tasksDir = join(sliceDir, "tasks");
+  writeFileSync(
+    join(sliceDir, "S01-PLAN.md"),
+    "# S01: Slice\n\n## Tasks\n\nTask rows live in the DB; this projection intentionally has no legacy task syntax.\n",
+  );
+  writeFileSync(join(tasksDir, "T01-PLAN.md"), "# T01 Plan\n");
+
+  const result = verifyExpectedArtifact("plan-slice", "M001/S01", base);
+  assert.equal(result, false, "DB task rows must still require matching task plan files");
+});
+
 // ─── verifyExpectedArtifact: heading-style plan tasks (#1691) ─────────────
 
 test("verifyExpectedArtifact accepts plan-slice with heading-style tasks (### T01 --)", (t) => {
@@ -453,6 +506,32 @@ test("verifyExpectedArtifact accepts plan-slice with colon-style heading tasks (
     verifyExpectedArtifact("plan-slice", "M001/S01", base),
     true,
     "Colon heading-style plan should be treated as completed artifact",
+  );
+});
+
+test("verifyExpectedArtifact accepts indented legacy plan-slice task markers", (t) => {
+  const base = makeTmpBase();
+  t.after(() => cleanup(base));
+
+  const sliceDir = join(base, ".gsd", "milestones", "M001", "slices", "S01");
+  const tasksDir = join(sliceDir, "tasks");
+  mkdirSync(tasksDir, { recursive: true });
+  writeFileSync(join(sliceDir, "S01-PLAN.md"), [
+    "# S01: Test Slice",
+    "",
+    "## Tasks",
+    "",
+    "  - [ ] **T01: Implement feature** `est:1h`",
+    "",
+    "  ### T02 -- Write tests",
+  ].join("\n"));
+  writeFileSync(join(tasksDir, "T01-PLAN.md"), "# T01 Plan");
+  writeFileSync(join(tasksDir, "T02-PLAN.md"), "# T02 Plan");
+
+  assert.strictEqual(
+    verifyExpectedArtifact("plan-slice", "M001/S01", base),
+    true,
+    "Indented legacy task markers should be treated as completed plan-slice artifacts",
   );
 });
 
@@ -715,6 +794,26 @@ test("hasImplementationArtifacts returns 'present' when implementation files com
 
   const result = hasImplementationArtifacts(base);
   assert.equal(result, "present", "should return 'present' when implementation files are present");
+});
+
+test("hasImplementationArtifacts finds production execute-task commits after retry resumes on main (#4699)", (t) => {
+  const base = makeGitBase();
+  t.after(() => cleanup(base));
+
+  mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+  writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-ROADMAP.md"), "# Roadmap");
+  execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "chore: auto-commit after plan-milestone\n\nGSD-Unit: M001"], { cwd: base, stdio: "ignore" });
+
+  mkdirSync(join(base, "src"), { recursive: true });
+  mkdirSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks"), { recursive: true });
+  writeFileSync(join(base, "src", "feature.ts"), "export function feature() {}");
+  writeFileSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks", "T01-SUMMARY.md"), "# Summary");
+  execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "feat: add milestone feature\n\nGSD-Task: S01/T01"], { cwd: base, stdio: "ignore" });
+
+  const result = hasImplementationArtifacts(base, "M001");
+  assert.equal(result, "present", "main self-diff retry should find production execute-task commits");
 });
 
 test("hasImplementationArtifacts returns 'unknown' on non-git directory (fail-open)", (t) => {

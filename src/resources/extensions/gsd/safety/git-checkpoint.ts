@@ -23,7 +23,7 @@ const CHECKPOINT_PREFIX = "refs/gsd/checkpoints/";
  */
 export function createCheckpoint(basePath: string, unitId: string): string | null {
   try {
-    const sha = execFileSync("git", ["rev-parse", "HEAD"], {
+    const sha = execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
       cwd: basePath,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf-8",
@@ -41,6 +41,15 @@ export function createCheckpoint(basePath: string, unitId: string): string | nul
 
     return sha;
   } catch (e) {
+    const stderr = (e as { stderr?: Buffer | string }).stderr;
+    const stderrText = Buffer.isBuffer(stderr) ? stderr.toString("utf-8") : String(stderr ?? "");
+    if (
+      stderrText.includes("Needed a single revision") ||
+      stderrText.includes("unknown revision") ||
+      stderrText.includes("ambiguous argument 'HEAD'")
+    ) {
+      return null;
+    }
     logWarning("safety", `checkpoint creation failed: ${(e as Error).message}`);
     return null;
   }
@@ -70,6 +79,21 @@ export function rollbackToCheckpoint(
     if (!branch || branch === "HEAD") {
       logWarning("safety", "rollback: detached HEAD state, cannot rollback");
       return false;
+    }
+
+    // Preserve any staged or untracked user work before the hard reset.
+    // The user may have a partial fix staged that they wanted to inspect;
+    // reset --hard wipes both staged and unstaged changes (reflog only
+    // covers committed state). Push a labeled stash first so recovery
+    // is possible. (Issue #4980 HIGH-4)
+    try {
+      execFileSync(
+        "git",
+        ["stash", "push", "--include-untracked", "-m", `gsd: pre-rollback-stash ${unitId} ${new Date().toISOString()}`],
+        { cwd: basePath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+      );
+    } catch {
+      /* nothing to stash, or stash refused — proceed with reset */
     }
 
     // Reset branch pointer and working tree to checkpoint SHA in one step.

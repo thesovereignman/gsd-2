@@ -1,3 +1,4 @@
+// GSD2 - Shared AI provider type definitions
 import type { AssistantMessageEventStream } from "./utils/event-stream.js";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream.js";
@@ -116,6 +117,8 @@ export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
+	/** Workspace root for providers that spawn local processes. */
+	cwd?: string;
 	reasoning?: ThinkingLevel;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
@@ -201,6 +204,19 @@ export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
 	timestamp: number; // Unix timestamp in milliseconds
+	/**
+	 * Hint to provider adapters that this message marks a stable point in the
+	 * conversation suitable as a prompt-cache anchor. Providers that support
+	 * prompt caching (e.g. Anthropic) may apply a `cache_control` breakpoint
+	 * here so the prefix up to and including this message can earn cache
+	 * reads on subsequent turns.
+	 *
+	 * Optional and additive — providers that do not support caching, or
+	 * messages without the hint, behave exactly as before. Set by upstream
+	 * code that knows the message represents a stable boundary (e.g. a
+	 * compaction summary). (#5027)
+	 */
+	cacheBreakpoint?: boolean;
 }
 
 export interface AssistantMessage {

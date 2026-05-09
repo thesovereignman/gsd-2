@@ -1,12 +1,10 @@
-// tool-naming — Verifies canonical + alias tool registration for GSD DB tools.
-//
-// Each DB tool must register under its canonical gsd_concept_action name
-// AND under a backward-compatible alias name.
-// The alias must share the exact same execute function reference as the canonical tool.
+// Project/App: GSD-2
+// File Purpose: Verifies canonical and alias DB tool registration plus legacy alias telemetry.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { registerDbTools } from '../bootstrap/db-tools.ts';
+import { getLegacyTelemetry, resetLegacyTelemetry } from '../legacy-telemetry.ts';
 
 
 // ─── Mock PI ──────────────────────────────────────────────────────────────────
@@ -36,6 +34,9 @@ const RENAME_MAP: Array<{ canonical: string; alias: string }> = [
   { canonical: "gsd_reassess_roadmap", alias: "gsd_roadmap_reassess" },
   { canonical: "gsd_complete_milestone", alias: "gsd_milestone_complete" },
   { canonical: "gsd_validate_milestone", alias: "gsd_milestone_validate" },
+  { canonical: "gsd_task_reopen", alias: "gsd_reopen_task" },
+  { canonical: "gsd_slice_reopen", alias: "gsd_reopen_slice" },
+  { canonical: "gsd_milestone_reopen", alias: "gsd_reopen_milestone" },
 ];
 
 // ─── Registration count ──────────────────────────────────────────────────────
@@ -45,7 +46,11 @@ console.log('\n── Tool naming: registration count ──');
 const pi = makeMockPi();
 registerDbTools(pi);
 
-assert.deepStrictEqual(pi.tools.length, 30, 'Should register exactly 30 tools (14 canonical + 14 aliases + 1 gate tool + 1 gsd_skip_slice)');
+assert.deepStrictEqual(
+  pi.tools.length,
+  RENAME_MAP.length * 2 + 2,
+  'Should register canonical/alias tool pairs plus 1 gate tool and 1 gsd_skip_slice',
+);
 
 // ─── Both names exist for each pair ──────────────────────────────────────────
 
@@ -59,9 +64,9 @@ for (const { canonical, alias } of RENAME_MAP) {
   assert.ok(aliasTool !== undefined, `Alias tool "${alias}" should be registered`);
 }
 
-// ─── Execute function identity ───────────────────────────────────────────────
+// ─── Execute function wrapping ───────────────────────────────────────────────
 
-console.log('\n── Tool naming: execute function identity (===) ──');
+console.log('\n── Tool naming: alias execute wrapper ──');
 
 for (const { canonical, alias } of RENAME_MAP) {
   const canonicalTool = pi.tools.find((t: any) => t.name === canonical);
@@ -69,11 +74,36 @@ for (const { canonical, alias } of RENAME_MAP) {
 
   if (canonicalTool && aliasTool) {
     assert.ok(
-      canonicalTool.execute === aliasTool.execute,
-      `"${canonical}" and "${alias}" should share the same execute function reference`,
+      canonicalTool.execute !== aliasTool.execute,
+      `"${alias}" should wrap "${canonical}" so alias usage can be counted`,
     );
   }
 }
+
+test("alias execute increments legacy MCP alias telemetry before delegating", async () => {
+  const canonicalTool = pi.tools.find((t: any) => t.name === "gsd_decision_save");
+  const aliasTool = pi.tools.find((t: any) => t.name === "gsd_save_decision");
+  assert.ok(canonicalTool);
+  assert.ok(aliasTool);
+
+  const originalCanonicalExecute = canonicalTool.execute;
+  try {
+    resetLegacyTelemetry();
+    let delegated = false;
+    canonicalTool.execute = async () => {
+      delegated = true;
+      return { content: [{ type: "text", text: "ok" }], details: { ok: true } };
+    };
+
+    await aliasTool.execute("call-1", {}, undefined, undefined, undefined);
+
+    assert.equal(delegated, true);
+    assert.equal(getLegacyTelemetry()["legacy.mcpAliasUsed"], 1);
+  } finally {
+    canonicalTool.execute = originalCanonicalExecute;
+    resetLegacyTelemetry();
+  }
+});
 
 // ─── Alias descriptions include "(alias for ...)" ───────────────────────────
 

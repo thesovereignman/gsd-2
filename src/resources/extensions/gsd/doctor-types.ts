@@ -19,6 +19,7 @@ export type DoctorIssueCode =
   | "stale_parallel_session"
   | "orphaned_completed_units"
   | "stale_hook_state"
+  | "uat_retry_exhausted"
   | "activity_log_bloat"
   | "state_file_stale"
   | "state_file_missing"
@@ -80,7 +81,9 @@ export type DoctorIssueCode =
   | "db_done_task_no_summary"
   | "db_duplicate_id"
   | "db_unavailable"
-  | "projection_drift";
+  | "projection_drift"
+  // Milestone filesystem/DB drift (#4996)
+  | "orphan_milestone_dir";
 
 /**
  * Issue codes that represent global or completion-critical state.

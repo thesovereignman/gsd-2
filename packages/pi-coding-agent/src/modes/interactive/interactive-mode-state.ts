@@ -1,3 +1,4 @@
+import type { ImageContent } from "@gsd/pi-ai";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 
 export interface InteractiveModeStateHost {
@@ -19,6 +20,7 @@ export interface InteractiveModeStateHost {
 	isInitialized: boolean;
 	loadingAnimation?: any;
 	pendingWorkingMessage?: string;
+	clearBlockingError(): void;
 	defaultWorkingMessage: string;
 	streamingComponent?: any;
 	streamingMessage?: any;
@@ -32,7 +34,7 @@ export interface InteractiveModeStateHost {
 	extensionEditor?: any;
 	editorContainer: any;
 	keybindingsManager?: any;
+	pendingImages: ImageContent[];
 }
 
 export type InteractiveModeEvent = AgentSessionEvent;
-

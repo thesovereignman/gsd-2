@@ -247,6 +247,7 @@ export class ModelRegistry {
 	private discoveryCache: ModelDiscoveryCache;
 	private customProviderApiKeys: Map<string, string> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
+	private disabledModelProviders: Set<string> = new Set();
 	private loadError: string | undefined = undefined;
 
 	constructor(
@@ -554,10 +555,33 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Set provider IDs that should be excluded from model selection/routing.
+	 * This does not affect direct tool auth flows that resolve provider keys.
+	 */
+	setDisabledModelProviders(providers: string[]): void {
+		this.disabledModelProviders = new Set(
+			providers
+				.map((provider) => provider.trim().toLowerCase())
+				.filter((provider) => provider.length > 0),
+		);
+	}
+
+	/**
+	 * Get current provider denylist used for model selection/routing.
+	 */
+	getDisabledModelProviders(): string[] {
+		return Array.from(this.disabledModelProviders);
+	}
+
+	/**
 	 * Get auth mode for a provider.
 	 * Defaults to "apiKey" for built-ins and providers without explicit mode.
 	 */
 	getProviderAuthMode(provider: string): ProviderAuthMode {
+		// E2E-test-only: the fake provider is keyless. Sentinel is project-
+		// internal ("gsd-fake") so it cannot collide with a real provider.
+		// See packages/pi-ai/src/providers/fake.ts.
+		if (provider === "gsd-fake") return "none";
 		const config = this.registeredProviders.get(provider);
 		if (!config) return "apiKey";
 		if (config.authMode) return config.authMode;
@@ -570,6 +594,7 @@ export class ModelRegistry {
 	 * Whether a provider can be used for requests/fallback without hard auth gating.
 	 */
 	isProviderRequestReady(provider: string): boolean {
+		if (this.disabledModelProviders.has(provider.trim().toLowerCase())) return false;
 		const config = this.registeredProviders.get(provider);
 		if (config?.isReady) return config.isReady();
 		const authMode = this.getProviderAuthMode(provider);

@@ -1,3 +1,4 @@
+// GSD2 complete-milestone tool handler
 /**
  * complete-milestone handler — the core operation behind gsd_complete_milestone.
  *
@@ -31,21 +32,21 @@ export interface CompleteMilestoneParams {
   oneLiner: string;
   narrative: string;
   verificationPassed: boolean;
-  /** @optional — defaults to "Not provided." when omitted by models with limited tool-calling */
+  /** @optional — empty/omitted renders as "Not provided." */
   successCriteriaResults?: string;
-  /** @optional — defaults to "Not provided." when omitted */
+  /** @optional — empty/omitted renders as "Not provided." */
   definitionOfDoneResults?: string;
-  /** @optional — defaults to "Not provided." when omitted */
+  /** @optional — empty/omitted renders as "Not provided." */
   requirementOutcomes?: string;
-  /** @optional — defaults to [] when omitted */
+  /** @optional — empty/omitted renders as "(none)" */
   keyDecisions?: string[];
-  /** @optional — defaults to [] when omitted */
+  /** @optional — empty/omitted renders as "(none)" */
   keyFiles?: string[];
-  /** @optional — defaults to [] when omitted */
+  /** @optional — empty/omitted renders as "(none)" */
   lessonsLearned?: string[];
-  /** @optional — defaults to "None." when omitted */
+  /** @optional — empty/omitted renders as "None." */
   followUps?: string;
-  /** @optional — defaults to "None." when omitted */
+  /** @optional — empty/omitted renders as "None." */
   deviations?: string;
   /** Optional caller-provided identity for audit trail */
   actorName?: string;
@@ -56,10 +57,11 @@ export interface CompleteMilestoneParams {
 export interface CompleteMilestoneResult {
   milestoneId: string;
   summaryPath: string;
+  stale?: boolean;
+  alreadyComplete?: boolean;
 }
 
-function renderMilestoneSummaryMarkdown(params: CompleteMilestoneParams): string {
-  const now = new Date().toISOString();
+function renderMilestoneSummaryMarkdown(params: CompleteMilestoneParams, completedAt: string): string {
   const displayTitle = stripIdPrefix(params.title, params.milestoneId);
 
   // Apply defaults for optional enrichment fields (#2771)
@@ -83,7 +85,7 @@ function renderMilestoneSummaryMarkdown(params: CompleteMilestoneParams): string
 id: ${params.milestoneId}
 title: "${displayTitle}"
 status: complete
-completed_at: ${now}
+completed_at: ${completedAt}
 key_decisions:
 ${keyDecisionsYaml}
 key_files:
@@ -102,15 +104,15 @@ ${params.narrative}
 
 ## Success Criteria Results
 
-${params.successCriteriaResults ?? "Not provided."}
+${params.successCriteriaResults || "Not provided."}
 
 ## Definition of Done Results
 
-${params.definitionOfDoneResults ?? "Not provided."}
+${params.definitionOfDoneResults || "Not provided."}
 
 ## Requirement Outcomes
 
-${params.requirementOutcomes ?? "Not provided."}
+${params.requirementOutcomes || "Not provided."}
 
 ## Deviations
 
@@ -142,6 +144,7 @@ export async function handleCompleteMilestone(
   // ── Guards + DB writes inside a single transaction (prevents TOCTOU) ───
   const completedAt = new Date().toISOString();
   let guardError: string | null = null;
+  let alreadyComplete = false;
 
   transaction(() => {
     // State machine preconditions (inside txn for atomicity)
@@ -151,7 +154,7 @@ export async function handleCompleteMilestone(
       return;
     }
     if (isClosedStatus(milestone.status)) {
-      guardError = `milestone ${params.milestoneId} is already complete`;
+      alreadyComplete = true;
       return;
     }
 
@@ -189,7 +192,7 @@ export async function handleCompleteMilestone(
   }
 
   // ── Filesystem operations (outside transaction) ─────────────────────────
-  const summaryMd = renderMilestoneSummaryMarkdown(params);
+  const summaryMd = renderMilestoneSummaryMarkdown(params, completedAt);
 
   let summaryPath: string;
   const milestoneDir = resolveMilestonePath(basePath, params.milestoneId);
@@ -206,15 +209,15 @@ export async function handleCompleteMilestone(
   // This handles re-dispatch scenarios (DB/disk state divergence) where a prior
   // completion already wrote the file. Overwriting would silently destroy the
   // richer content the agent produced during the original completion run.
+  let projectionStale = false;
   if (!existsSync(summaryPath)) {
     try {
       await saveFile(summaryPath, summaryMd);
     } catch (renderErr) {
-      // Disk render failed — roll back DB status so state stays consistent
-      logWarning("tool", `complete_milestone — disk render failed, rolling back DB status: ${(renderErr as Error).message}`);
-      updateMilestoneStatus(params.milestoneId, 'active', null);
-      invalidateStateCache();
-      return { error: `disk render failed: ${(renderErr as Error).message}` };
+      projectionStale = true;
+      logWarning("projection", `complete_milestone projection write failed for ${params.milestoneId}; DB completion remains committed`, {
+        error: (renderErr as Error).message,
+      });
     }
   }
 
@@ -237,14 +240,16 @@ export async function handleCompleteMilestone(
     logWarning("tool", `complete-milestone manifest warning: ${(mfErr as Error).message}`);
   }
   try {
-    appendEvent(basePath, {
-      cmd: "complete-milestone",
-      params: { milestoneId: params.milestoneId },
-      ts: new Date().toISOString(),
-      actor: "agent",
-      actor_name: params.actorName,
-      trigger_reason: params.triggerReason,
-    });
+    if (!alreadyComplete) {
+      appendEvent(basePath, {
+        cmd: "complete-milestone",
+        params: { milestoneId: params.milestoneId },
+        ts: new Date().toISOString(),
+        actor: "agent",
+        actor_name: params.actorName,
+        trigger_reason: params.triggerReason,
+      });
+    }
   } catch (eventErr) {
     logError("tool", `complete-milestone event log FAILED — completion invisible to reconciliation`, { error: (eventErr as Error).message });
   }
@@ -252,5 +257,7 @@ export async function handleCompleteMilestone(
   return {
     milestoneId: params.milestoneId,
     summaryPath,
+    ...(projectionStale ? { stale: true } : {}),
+    ...(alreadyComplete ? { alreadyComplete: true } : {}),
   };
 }

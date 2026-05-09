@@ -64,7 +64,8 @@ description: "Every GSD command, keyboard shortcut, and CLI flag."
 
 | Command | Description |
 |---------|-------------|
-| `/gsd new-milestone` | Create a new milestone |
+| `/gsd new-project [--deep]` | Bootstrap a new project; `--deep` enables staged project-level discovery |
+| `/gsd new-milestone [--deep]` | Create a new milestone; `--deep` opts the project into deep planning mode |
 | `/gsd skip` | Prevent a unit from auto-mode dispatch |
 | `/gsd undo` | Revert last completed unit |
 | `/gsd undo-task` | Reset a specific task's completion state |
@@ -107,10 +108,16 @@ description: "Every GSD command, keyboard shortcut, and CLI flag."
 
 | Command | Description |
 |---------|-------------|
-| `/gsd extensions list` | List all extensions and their status |
+| `/gsd extensions list` | List all extensions and their status. User-installed entries show `[user]` plus the install source |
 | `/gsd extensions enable <id>` | Enable a disabled extension |
 | `/gsd extensions disable <id>` | Disable an extension |
 | `/gsd extensions info <id>` | Show extension details |
+| `/gsd extensions install <spec>` | Install a user extension. `<spec>` is an npm package, a git URL, or a local path. Restart GSD to activate. (v2.78) |
+| `/gsd extensions uninstall <id>` | Remove a user-installed extension. Warns if other extensions depend on it. (v2.78) |
+| `/gsd extensions update [id]` | Update a single user-installed npm extension to its latest version, or all of them when `id` is omitted. Git/local installs are skipped — reinstall to update. (v2.78) |
+| `/gsd extensions validate <path>` | Validate an extension package directory against the manifest schema before publishing or installing. (v2.78) |
+
+Install sources are auto-detected: a `git`/`http(s)` URL or `.git` suffix triggers `git clone`; a path that exists on disk is copied locally; everything else is fetched via `npm pack`. Installed extensions land in `~/.gsd/extensions/<id>/` and the registry records the source so `update` can re-fetch.
 
 ## Keyboard shortcuts
 

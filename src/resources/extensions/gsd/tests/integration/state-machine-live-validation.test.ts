@@ -575,7 +575,7 @@ describe("state-machine-live-validation", () => {
       assert.match((result as any).error, /verification did not pass/);
     });
 
-    test("double milestone completion returns error", async () => {
+    test("double milestone completion is idempotent", async () => {
       base = createFullFixture();
       openDatabase(join(base, ".gsd", "gsd.db"));
       insertMilestone({ id: "M001", title: "Done", status: "complete" });
@@ -583,8 +583,10 @@ describe("state-machine-live-validation", () => {
       insertTask({ id: "T01", sliceId: "S01", milestoneId: "M001", status: "complete" });
 
       const result = await handleCompleteMilestone(makeMilestoneParams("M001") as any, base);
-      assert.ok("error" in result);
-      assert.match((result as any).error, /already complete/);
+      assert.ok(!("error" in result), `already-complete milestone should be accepted: ${JSON.stringify(result)}`);
+      assert.equal(result.alreadyComplete, true);
+      assert.match(result.summaryPath, /M001-SUMMARY\.md$/);
+      assert.ok(isClosedStatus(getMilestone("M001")!.status), "milestone remains closed");
     });
   });
 
@@ -936,9 +938,11 @@ describe("state-machine-live-validation", () => {
       insertMilestone({ id: "M001", title: "Active", status: "active" });
       insertSlice({ id: "S01", milestoneId: "M001", title: "First", status: "in_progress" });
       insertTask({ id: "T01", sliceId: "S01", milestoneId: "M001", status: "pending" });
+      insertTask({ id: "T02", sliceId: "S01", milestoneId: "M001", status: "pending" });
 
       // Complete task + slice
       await handleCompleteTask(makeTaskParams("T01", "S01", "M001") as any, base);
+      await handleCompleteTask(makeTaskParams("T02", "S01", "M001") as any, base);
       await handleCompleteSlice(makeSliceParams("S01", "M001") as any, base);
       assert.ok(isClosedStatus(getSlice("M001", "S01")!.status));
 
@@ -946,9 +950,11 @@ describe("state-machine-live-validation", () => {
       await handleReopenSlice({ milestoneId: "M001", sliceId: "S01" }, base);
       assert.equal(getSlice("M001", "S01")!.status, "in_progress");
       assert.equal(getTask("M001", "S01", "T01")!.status, "pending");
+      assert.equal(getTask("M001", "S01", "T02")!.status, "pending");
 
       // Re-complete task + slice succeeds
       await handleCompleteTask(makeTaskParams("T01", "S01", "M001") as any, base);
+      await handleCompleteTask(makeTaskParams("T02", "S01", "M001") as any, base);
       const r = await handleCompleteSlice(makeSliceParams("S01", "M001") as any, base);
       assert.ok(!("error" in r), `re-complete slice: ${JSON.stringify(r)}`);
       assert.ok(isClosedStatus(getSlice("M001", "S01")!.status));

@@ -1,13 +1,12 @@
 // @gsd-build/mcp-server — Environment variable write utilities
-// Copyright (c) 2026 Jeremy McSpadden <jeremy@fluxlabs.net>
 //
 // Shared helpers for writing env vars to .env files, detecting project
 // destinations, and checking existing keys. Used by secure_env_collect
 // MCP tool. No TUI dependencies — pure filesystem + process.env operations.
 
-import { readFile, writeFile } from "node:fs/promises";
-import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { open, readFile, rename, rm } from "node:fs/promises";
+import { constants, existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
 // checkExistingEnvKeys
@@ -71,10 +70,19 @@ export async function writeEnvKey(filePath: string, key: string, value: string):
   if (typeof value !== "string") {
     throw new TypeError(`writeEnvKey expects a string value for key "${key}", got ${typeof value}`);
   }
+  assertWritableEnvFileTarget(filePath);
   let content = "";
   try {
-    content = await readFile(filePath, "utf8");
-  } catch {
+    const handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      content = await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
     content = "";
   }
   const escaped = value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "");
@@ -86,7 +94,42 @@ export async function writeEnvKey(filePath: string, key: string, value: string):
     if (content.length > 0 && !content.endsWith("\n")) content += "\n";
     content += `${line}\n`;
   }
-  await writeFile(filePath, content, "utf8");
+  const tempPath = join(
+    dirname(filePath),
+    `.${basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    await handle.writeFile(content, "utf8");
+    await handle.close();
+    handle = undefined;
+    assertWritableEnvFileTarget(filePath);
+    await rename(tempPath, filePath);
+  } catch (err) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
+function assertWritableEnvFileTarget(filePath: string): void {
+  try {
+    if (lstatSync(filePath).isSymbolicLink()) {
+      throw new Error("Refusing to write symlinked env file");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,8 +140,57 @@ export function isSafeEnvVarKey(key: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key);
 }
 
+/**
+ * Keys that influence the MCP server's own runtime — module loading, project
+ * sandbox, CLI resolution. Allowing the LLM to set these via secure_env_collect
+ * would let a misbehaving caller swap the workflow executor module mid-session
+ * (RCE chain) or escape the project sandbox. We refuse to write or hydrate
+ * these keys even when isSafeEnvVarKey() would otherwise accept them.
+ */
+const SECURITY_SENSITIVE_KEYS = new Set<string>([
+  "GSD_WORKFLOW_EXECUTORS_MODULE",
+  "GSD_WORKFLOW_WRITE_GATE_MODULE",
+  "GSD_WORKFLOW_PROJECT_ROOT",
+  "GSD_CLI_PATH",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PATH",
+  "LD_PRELOAD",
+  "DYLD_INSERT_LIBRARIES",
+]);
+
+export function isSecuritySensitiveEnvKey(key: string): boolean {
+  return SECURITY_SENSITIVE_KEYS.has(key.toUpperCase());
+}
+
 export function isSupportedDeploymentEnvironment(env: string): boolean {
   return env === "development" || env === "preview" || env === "production";
+}
+
+function isWithinProjectRoot(projectRoot: string, candidatePath: string): boolean {
+  const rel = relative(projectRoot, candidatePath);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+export function resolveProjectEnvFilePath(projectDir: string, envFilePath = ".env"): string {
+  const projectRoot = realpathSync.native(resolve(projectDir));
+  const candidate = resolve(projectRoot, envFilePath);
+  if (!isWithinProjectRoot(projectRoot, candidate)) {
+    throw new Error("envFilePath must resolve inside the project directory");
+  }
+  if (existsSync(candidate)) {
+    const targetRealPath = realpathSync.native(candidate);
+    if (isWithinProjectRoot(projectRoot, targetRealPath)) {
+      return candidate;
+    }
+    throw new Error("envFilePath must resolve inside the project directory");
+  }
+  const candidateParent = dirname(candidate);
+  const parentRealPath = realpathSync.native(candidateParent);
+  if (isWithinProjectRoot(projectRoot, parentRealPath)) {
+    return candidate;
+  }
+  throw new Error("envFilePath must resolve inside the project directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +210,10 @@ interface ApplyResult {
   errors: string[];
 }
 
+interface ExecOptions {
+  stdin?: string;
+}
+
 /**
  * Apply collected secrets to the target destination.
  * Dotenv writes are handled directly; vercel/convex shell out via execFn.
@@ -128,7 +224,7 @@ export async function applySecrets(
   opts: {
     envFilePath: string;
     environment?: string;
-    execFn?: (cmd: string, args: string[]) => Promise<{ code: number; stderr: string }>;
+    execFn?: (cmd: string, args: string[], opts?: ExecOptions) => Promise<{ code: number; stderr: string }>;
   },
 ): Promise<ApplyResult> {
   const applied: string[] = [];
@@ -136,10 +232,20 @@ export async function applySecrets(
 
   if (destination === "dotenv") {
     for (const { key, value } of provided) {
+      if (!isSafeEnvVarKey(key)) {
+        errors.push(`${key}: invalid environment variable name`);
+        continue;
+      }
+      if (isSecuritySensitiveEnvKey(key)) {
+        errors.push(`${key}: refusing to set MCP server runtime variable via secure_env_collect`);
+        continue;
+      }
       try {
         await writeEnvKey(opts.envFilePath, key, value);
         applied.push(key);
-        // Hydrate process.env so the current session sees the new value
+        // Hydrate process.env so the current session sees the new value.
+        // Sensitive keys are excluded above so a malicious caller cannot
+        // swap our module-loading or sandbox configuration mid-session.
         process.env[key] = value;
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -159,18 +265,21 @@ export async function applySecrets(
         errors.push(`${key}: invalid environment variable name`);
         continue;
       }
-      const cmd = destination === "vercel"
-        ? `printf %s ${shellEscapeSingle(value)} | vercel env add ${key} ${env}`
-        : "";
+      if (isSecuritySensitiveEnvKey(key)) {
+        errors.push(`${key}: refusing to set MCP server runtime variable via secure_env_collect`);
+        continue;
+      }
       try {
         const result = destination === "vercel"
-          ? await opts.execFn("sh", ["-c", cmd])
-          : await opts.execFn("npx", ["convex", "env", "set", key, value]);
+          ? await opts.execFn("vercel", ["env", "add", key, env], { stdin: value })
+          : await opts.execFn("npx", ["convex", "env", "set", key], { stdin: value });
         if (result.code !== 0) {
           errors.push(`${key}: ${result.stderr.slice(0, 200)}`);
         } else {
           applied.push(key);
-          process.env[key] = value;
+          // Do NOT hydrate process.env after pushing to a remote destination:
+          // no in-process reader needs a freshly-pushed remote secret, and
+          // every spawned child would inherit the plaintext value.
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

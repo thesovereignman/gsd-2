@@ -69,6 +69,7 @@ function makeMilestoneRow(overrides: Partial<MilestoneRow> = {}): MilestoneRow {
     definition_of_done: [],
     requirement_coverage: "",
     boundary_map_markdown: "",
+    sequence: 0,
     ...overrides,
   };
 }
@@ -275,6 +276,7 @@ describe("#2945 Bug 3: mergeAndExit must teardown worktree after successful merg
       gitService: {} as unknown,
     } as unknown as AutoSession;
 
+    const { WorktreeStateProjection } = await import("../worktree-state-projection.ts");
     const mockDeps = {
       isInAutoWorktree: () => true,
       shouldUseWorktreeIsolation: () => true,
@@ -290,6 +292,7 @@ describe("#2945 Bug 3: mergeAndExit must teardown worktree after successful merg
       getAutoWorktreePath: () => null,
       autoCommitCurrentBranch: () => {},
       getCurrentBranch: () => "main",
+      checkoutBranch: () => {},
       autoWorktreeBranch: () => "gsd/M001",
       resolveMilestoneFile: () => "/mock/roadmap.md",
       readFileSync: () => "# Roadmap content",
@@ -298,15 +301,15 @@ describe("#2945 Bug 3: mergeAndExit must teardown worktree after successful merg
       invalidateAllCaches: () => {},
       captureIntegrationBranch: () => {},
       enterBranchModeForMilestone: () => {},
+      worktreeProjection: new WorktreeStateProjection(),
     };
 
-    // Import and create resolver
     // We test the behavior contract: after a successful merge, teardown must be called
-    const { WorktreeResolver } = await import("../worktree-resolver.ts");
-    const resolver = new WorktreeResolver(mockSession, mockDeps);
+    const { WorktreeLifecycle } = await import("../worktree-lifecycle.ts");
+    const lifecycle = new WorktreeLifecycle(mockSession, mockDeps as never);
 
     const ctx = { notify: () => {} };
-    resolver.mergeAndExit("M001", ctx);
+    lifecycle.exitMilestone("M001", { merge: true }, ctx);
 
     assert.ok(
       teardownCalled,

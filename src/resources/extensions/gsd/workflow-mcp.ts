@@ -33,6 +33,7 @@ const MCP_WORKFLOW_TOOL_SURFACE = new Set([
   "gsd_journal_query",
   "gsd_milestone_complete",
   "gsd_milestone_generate_id",
+  "gsd_milestone_reopen",
   "gsd_checkpoint_db",
   "gsd_milestone_status",
   "gsd_milestone_validate",
@@ -41,6 +42,9 @@ const MCP_WORKFLOW_TOOL_SURFACE = new Set([
   "gsd_plan_slice",
   "gsd_replan_slice",
   "gsd_reassess_roadmap",
+  "gsd_reopen_milestone",
+  "gsd_reopen_slice",
+  "gsd_reopen_task",
   "gsd_requirement_save",
   "gsd_requirement_update",
   "gsd_roadmap_reassess",
@@ -50,9 +54,11 @@ const MCP_WORKFLOW_TOOL_SURFACE = new Set([
   "gsd_skip_slice",
   "gsd_slice_replan",
   "gsd_slice_complete",
+  "gsd_slice_reopen",
   "gsd_summary_save",
   "gsd_task_plan",
   "gsd_task_complete",
+  "gsd_task_reopen",
   "gsd_update_requirement",
   "gsd_validate_milestone",
 ]);
@@ -201,7 +207,7 @@ function buildWorkflowLaunchEnv(
 
   return {
     ...(explicitEnv ?? {}),
-    ...(gsdCliPath ? { GSD_CLI_PATH: gsdCliPath } : {}),
+    ...(gsdCliPath ? { GSD_CLI_PATH: gsdCliPath, GSD_BIN_PATH: gsdCliPath } : {}),
     ...(executorModulePath ? { GSD_WORKFLOW_EXECUTORS_MODULE: executorModulePath } : {}),
     ...(writeGateModulePath ? { GSD_WORKFLOW_WRITE_GATE_MODULE: writeGateModulePath } : {}),
     ...(nodeOptions ? { NODE_OPTIONS: nodeOptions } : {}),
@@ -219,7 +225,11 @@ export function detectWorkflowMcpLaunchConfig(
   const explicitArgs = parseJsonEnv<unknown>(env, "GSD_WORKFLOW_MCP_ARGS");
   const explicitEnv = parseJsonEnv<Record<string, string>>(env, "GSD_WORKFLOW_MCP_ENV");
   const explicitCwd = env.GSD_WORKFLOW_MCP_CWD?.trim();
-  const gsdCliPath = env.GSD_CLI_PATH?.trim() || env.GSD_BIN_PATH?.trim();
+  const gsdCliPath =
+    explicitEnv?.GSD_CLI_PATH?.trim()
+    || explicitEnv?.GSD_BIN_PATH?.trim()
+    || env.GSD_CLI_PATH?.trim()
+    || env.GSD_BIN_PATH?.trim();
   const workflowProjectRoot =
     explicitEnv?.GSD_WORKFLOW_PROJECT_ROOT?.trim() ||
     env.GSD_WORKFLOW_PROJECT_ROOT?.trim() ||
@@ -292,6 +302,12 @@ export function buildWorkflowMcpServers(
 
 export function getRequiredWorkflowToolsForGuidedUnit(unitType: string): string[] {
   switch (unitType) {
+    case "discuss-project":
+      return ["ask_user_questions", "gsd_summary_save"];
+    case "discuss-requirements":
+      return ["ask_user_questions", "gsd_requirement_save", "gsd_summary_save"];
+    case "research-decision":
+      return ["ask_user_questions"];
     case "discuss-milestone":
       return ["gsd_summary_save", "gsd_plan_milestone"];
     case "discuss-slice":
@@ -314,6 +330,12 @@ export function getRequiredWorkflowToolsForGuidedUnit(unitType: string): string[
 
 export function getRequiredWorkflowToolsForAutoUnit(unitType: string): string[] {
   switch (unitType) {
+    case "discuss-project":
+      return ["ask_user_questions", "gsd_summary_save"];
+    case "discuss-requirements":
+      return ["ask_user_questions", "gsd_requirement_save", "gsd_summary_save"];
+    case "research-decision":
+      return ["ask_user_questions"];
     case "discuss-milestone":
       return ["gsd_summary_save", "gsd_plan_milestone"];
     case "research-milestone":
@@ -327,9 +349,9 @@ export function getRequiredWorkflowToolsForAutoUnit(unitType: string): string[] 
     case "execute-task":
     case "execute-task-simple":
     case "reactive-execute":
-      return ["gsd_complete_task"];
+      return ["gsd_task_complete"];
     case "complete-slice":
-      return ["gsd_complete_slice"];
+      return ["gsd_slice_complete"];
     case "replan-slice":
       return ["gsd_replan_slice"];
     case "reassess-roadmap":
@@ -352,11 +374,32 @@ export function usesWorkflowMcpTransport(
   return authMode === "externalCli" && typeof baseUrl === "string" && baseUrl.startsWith("local://");
 }
 
+function hasAskUserQuestionsTool(activeTools: string[]): boolean {
+  return activeTools.some((toolName) => {
+    if (toolName === "ask_user_questions") return true;
+    if (!toolName.startsWith("mcp__")) return false;
+    const toolSeparator = toolName.indexOf("__", "mcp__".length);
+    return toolSeparator >= 0 && toolName.slice(toolSeparator + 2) === "ask_user_questions";
+  });
+}
+
+function workflowMcpStructuredQuestionsOptIn(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.GSD_WORKFLOW_MCP_STRUCTURED_QUESTIONS;
+  return value === "1" || value === "true";
+}
+
 export function supportsStructuredQuestions(
   activeTools: string[],
-  options: Pick<WorkflowCapabilityOptions, "authMode" | "baseUrl"> = {},
+  options: Pick<WorkflowCapabilityOptions, "authMode" | "baseUrl" | "env"> = {},
 ): boolean {
-  if (!activeTools.includes("ask_user_questions")) return false;
+  if (!hasAskUserQuestionsTool(activeTools)) return false;
+  if (usesWorkflowMcpTransport(options.authMode, options.baseUrl)) {
+    // Claude Code local workflow-MCP exposes ask_user_questions, but form
+    // elicitation can return an immediate cancel outside GSD's chat turn. Keep
+    // checkpoints in plain chat unless a caller deliberately opts into testing
+    // that transport.
+    return workflowMcpStructuredQuestionsOptIn(options.env);
+  }
 
   return true;
 }

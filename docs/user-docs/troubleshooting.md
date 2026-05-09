@@ -13,13 +13,14 @@ It checks:
 - Roadmap ↔ slice ↔ task referential integrity
 - Completion state consistency
 - Git worktree health (worktree and branch modes only — skipped in none mode)
-- Stale lock files and orphaned runtime records
+- Stale DB-backed runtime records and orphaned runtime files
+- Disk-only orphan milestone stub directories
 
 ## Common Issues
 
 ### Auto mode loops on the same unit
 
-**Symptoms:** The same unit (e.g., `research-slice` or `plan-slice`) dispatches repeatedly until hitting the dispatch limit.
+**Symptoms:** The same unit (e.g., `research-slice` or `plan-slice`) dispatches repeatedly, then auto mode pauses with an "Artifact still missing..." error after 3 artifact verification retries.
 
 **Causes:**
 - Stale cache after a crash — the in-memory file listing doesn't reflect new artifacts
@@ -29,7 +30,7 @@ It checks:
 
 ### Auto mode stops with "Loop detected"
 
-**Cause:** A unit failed to produce its expected artifact twice in a row.
+**Cause:** The sliding-window detector found a repeated dispatch pattern that did not recover after the diagnostic retry. Missing expected artifacts usually surface through the bounded 3-attempt artifact verification retry path instead.
 
 **Fix:** Check the task plan for clarity. If the plan is ambiguous, refine it manually, then `/gsd auto` to resume.
 
@@ -105,15 +106,16 @@ For common provider setup issues (role errors, streaming errors, model ID mismat
 
 **Fix:** Increase `budget_ceiling` in preferences, or switch to `budget` token profile to reduce per-unit cost, then resume with `/gsd auto`.
 
-### Stale lock file
+### Auto mode says another session is running
 
 **Symptoms:** Auto mode won't start, says another session is running.
 
-**Fix:** GSD automatically detects stale locks — if the owning PID is dead, the lock is cleaned up and re-acquired on the next `/gsd auto`. This includes stranded `.gsd.lock/` directories left by `proper-lockfile` after crashes. If automatic recovery fails, delete `.gsd/auto.lock` and the `.gsd.lock/` directory manually:
+**Fix:** GSD now derives active-session ownership from DB-backed worker and dispatch state, not from `auto.lock` or `runtime/paused-session.json`. In most cases `/gsd doctor fix` clears stale runtime rows and the next `/gsd auto` re-acquires ownership automatically.
+
+If recovery still fails, repair runtime state instead of manually deleting individual lock files:
 
 ```bash
-rm -f .gsd/auto.lock
-rm -rf "$(dirname .gsd)/.gsd.lock"
+/gsd doctor fix
 ```
 
 ### Git merge conflicts
@@ -139,6 +141,14 @@ rm -rf "$(dirname .gsd)/.gsd.lock"
 **Fix:**
 - Run `/gsd doctor fix` to rewrite the stale milestone metadata automatically when the fallback is obvious.
 - If GSD still blocks, recreate the missing branch or update your git preferences so `git.main_branch` points at a real branch.
+
+### `/gsd doctor` reports `orphan_milestone_dir`
+
+**Symptoms:** `/gsd doctor` shows a warning like `Orphan milestone directory: M003` with issue code `orphan_milestone_dir`.
+
+**What it means:** `.gsd/milestones/<MID>/` exists on disk, but GSD cannot find a DB milestone row, a matching `.gsd/worktrees/<MID>/` worktree, or any milestone content files. These disk-only stub directories can be left behind by interrupted or stale forward references and can skew the next milestone ID that GSD generates.
+
+**Fix:** Run `/gsd doctor fix` to remove the orphan milestone stub directory automatically. The auto-fix only targets disk-only stubs with no DB row, no worktree, and no content files; populated milestone directories and in-flight worktree-only milestones are not removed.
 
 ### Transient `EBUSY` / `EPERM` / `EACCES` while writing `.gsd/` files
 
@@ -283,11 +293,10 @@ rm -rf "$(dirname .gsd)/.gsd.lock"
 ### Reset auto mode state
 
 ```bash
-rm .gsd/auto.lock
 rm .gsd/completed-units.json
 ```
 
-Then `/gsd auto` to restart from current disk state.
+Then run `/gsd doctor` to refresh projections and `/gsd auto` to restart from current DB-backed state.
 
 ### Reset routing history
 
@@ -297,13 +306,25 @@ If adaptive model routing is producing bad results, clear the routing history:
 rm .gsd/routing-history.json
 ```
 
-### Full state rebuild
+### Refresh rendered state
 
 ```
 /gsd doctor
 ```
 
-Doctor rebuilds `STATE.md` from plan and roadmap files on disk and fixes detected inconsistencies.
+Doctor checks the authoritative database, refreshes `STATE.md` from derived database state, and fixes detected projection or runtime-file inconsistencies.
+
+### Recover database hierarchy from markdown
+
+Use this only when the database is missing, damaged, or known to be stale but the rendered milestone, slice, and task markdown on disk is the best available source:
+
+```
+/gsd recover
+```
+
+`/gsd recover` clears the database hierarchy tables plus persisted validation/gate state from prior runs, including quality-gate rows and skipped-validation assessments, then reconstructs the hierarchy from markdown and derives state again to verify the result. Normal runtime does not silently import markdown projections, and worktree markdown is not synced back as authoritative state.
+
+For non-TTY environments (CI, cron, scripted automation), v2.79 adds `gsd headless recover` — same semantics, no interactive prompt. Exits non-zero on failure.
 
 ## Getting Help
 
@@ -346,9 +367,9 @@ Doctor rebuilds `STATE.md` from plan and roadmap files on disk and fixes detecte
 
 **Symptoms:** `gsd_decision_save` (or its alias `gsd_save_decision`), `gsd_requirement_update` (or `gsd_update_requirement`), or `gsd_summary_save` (or `gsd_save_summary`) fail with this error.
 
-**Cause:** The SQLite database wasn't initialized. This happens in manual `/gsd` sessions (non-auto mode) on versions before v2.29.
+**Cause:** The SQLite database was not initialized or could not be opened. Runtime state derivation will not silently fall back to markdown projections.
 
-**Fix:** Updated in v2.29+ to auto-initialize the database on first tool call. Upgrade to the latest version.
+**Fix:** Upgrade to the latest version, then run a GSD command from the project root to initialize or open the database. Use `/gsd inspect` for database diagnostics. If the database was lost or corrupted and markdown artifacts are the only usable state, run `/gsd recover` after GSD has opened the database.
 
 ## Verification Issues
 

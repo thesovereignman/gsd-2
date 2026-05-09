@@ -161,11 +161,27 @@ describe('doctor-proactive', async () => {
     });
 
     test('escalation: no double escalation', () => {
-      // Don't reset — should already be escalated from previous test
+      // Self-contained: drive the escalated state from scratch in this test.
+      // Previously this relied on module-singleton state left over from the
+      // preceding 'escalation: at threshold' test, which silently broke under
+      // filtered/parallel/reordered runs (the fallback `shouldEscalate: false`
+      // path was satisfied by the wrong reason — see #4828).
+      resetProactiveHealing();
+      for (let i = 0; i < 5; i++) {
+        recordHealthSnapshot(0, 0, 0); // older clean snapshots
+      }
+      for (let i = 0; i < 5; i++) {
+        recordHealthSnapshot(2, 1, 0); // recent error snapshots → degrading trend
+      }
+      // First check: trigger escalation.
+      const first = checkHealEscalation(2, [{ code: "test", message: "test error", unitId: "M001/S01" }]);
+      assert.deepStrictEqual(first.shouldEscalate, true, "precondition: first call escalates");
+
+      // Second check: same session, must NOT double-escalate.
       recordHealthSnapshot(2, 0, 0);
       const result = checkHealEscalation(2, [{ code: "test", message: "test error", unitId: "M001/S01" }]);
       assert.deepStrictEqual(result.shouldEscalate, false, "no double escalation in same session");
-      assert.ok(result.reason.includes("already escalated"), "reason explains why no escalation");
+      assert.ok(result.reason.includes("already escalated"), `reason must explain no-re-escalation (got: ${result.reason})`);
     });
 
     test('escalation: deferred when improving', () => {
@@ -224,17 +240,31 @@ describe('doctor-proactive', async () => {
       cleanups.push(dir);
       mkdirSync(join(dir, ".gsd"), { recursive: true });
 
-      // Write a stale lock
-      writeFileSync(join(dir, ".gsd", "auto.lock"), JSON.stringify({
-        pid: 9999999, startedAt: "2026-03-10T00:00:00Z",
-        unitType: "execute-task", unitId: "M001/S01/T01",
-        unitStartedAt: "2026-03-10T00:01:00Z", completedUnits: 3,
-      }));
+      // Phase C pt 2: stale lock state lives in the workers table now.
+      // Open the DB, insert a fake stale worker row directly (PID 9999999
+      // is functionally guaranteed dead), then close — the doctor will
+      // re-open via its own path.
+      const { openDatabase, _getAdapter } = await import("../../gsd-db.ts");
+      const { randomUUID } = await import("node:crypto");
+      openDatabase(join(dir, ".gsd", "gsd.db"));
+      const db = _getAdapter()!;
+      db.prepare(
+        `INSERT INTO workers (worker_id, host, pid, started_at, version, last_heartbeat_at, status, project_root_realpath)
+         VALUES (:w, 'test-host', 9999999, '2026-03-10T00:00:00Z', 'test', '1970-01-01T00:00:00.000Z', 'active', :root)`,
+      ).run({ ":w": `test-fake-${randomUUID().slice(0, 8)}`, ":root": dir });
+      const { closeDatabase } = await import("../../gsd-db.ts");
+      closeDatabase();
 
-      const result = await preDispatchHealthGate(dir);
-      assert.ok(result.proceed, "gate passes after auto-clearing stale lock");
-      assert.ok(result.fixesApplied.some(f => f.includes("cleared stale auto.lock")), "reports lock cleared");
-      assert.ok(!existsSync(join(dir, ".gsd", "auto.lock")), "lock file removed");
+      try {
+        const result = await preDispatchHealthGate(dir);
+        assert.ok(result.proceed, "gate passes after auto-clearing stale lock");
+        assert.ok(
+          result.fixesApplied.some(f => f.includes("cleared stale") || f.includes("cleared stale auto.lock")),
+          `reports lock cleared (got: ${result.fixesApplied.join(", ")})`,
+        );
+      } finally {
+        closeDatabase();
+      }
     });
 
     test('health gate: corrupt merge state auto-healed', async () => {

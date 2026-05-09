@@ -14,7 +14,7 @@ import { normalizeStringArray } from "../shared/format-utils.js";
 
 import {
   KNOWN_PREFERENCE_KEYS,
-  KNOWN_UNIT_TYPES,
+  KNOWN_UNIT_LABELS,
 
   SKILL_ACTIONS,
   type WorkflowMode,
@@ -275,6 +275,15 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
+  // ─── Planning Depth (deep planning mode) ─────────────────────────
+  if (preferences.planning_depth !== undefined) {
+    if (preferences.planning_depth === "light" || preferences.planning_depth === "deep") {
+      validated.planning_depth = preferences.planning_depth;
+    } else {
+      errors.push(`planning_depth must be "light" or "deep"`);
+    }
+  }
+
   // ─── Search Provider ─────────────────────────────────────────────
   if (preferences.search_provider !== undefined) {
     const validSearchProviders = new Set(["brave", "tavily", "ollama", "native", "auto"]);
@@ -432,7 +441,7 @@ export function validatePreferences(preferences: GSDPreferences): {
   if (preferences.post_unit_hooks && Array.isArray(preferences.post_unit_hooks)) {
     const validHooks: PostUnitHookConfig[] = [];
     const seenNames = new Set<string>();
-    const knownUnitTypes = new Set<string>(KNOWN_UNIT_TYPES);
+    const knownUnitTypes = new Set<string>(KNOWN_UNIT_LABELS);
     for (const hook of preferences.post_unit_hooks) {
       if (!hook || typeof hook !== "object") {
         errors.push("post_unit_hooks entry must be an object");
@@ -494,7 +503,7 @@ export function validatePreferences(preferences: GSDPreferences): {
   if (preferences.pre_dispatch_hooks && Array.isArray(preferences.pre_dispatch_hooks)) {
     const validPreHooks: PreDispatchHookConfig[] = [];
     const seenPreNames = new Set<string>();
-    const knownUnitTypes = new Set<string>(KNOWN_UNIT_TYPES);
+    const knownUnitTypes = new Set<string>(KNOWN_UNIT_LABELS);
     const validActions = new Set(["modify", "skip", "replace"]);
     for (const hook of preferences.pre_dispatch_hooks) {
       if (!hook || typeof hook !== "object") {
@@ -607,6 +616,27 @@ export function validatePreferences(preferences: GSDPreferences): {
       }
     } else {
       errors.push("dynamic_routing must be an object");
+    }
+  }
+
+  // ─── Disabled Model Providers ───────────────────────────────────────
+  if (preferences.disabled_model_providers !== undefined) {
+    if (Array.isArray(preferences.disabled_model_providers)) {
+      const allStrings = preferences.disabled_model_providers.every(
+        (provider: unknown) => typeof provider === "string",
+      );
+      if (!allStrings) {
+        errors.push("disabled_model_providers must be an array of strings");
+      } else {
+        const normalized = preferences.disabled_model_providers
+          .map((provider) => provider.trim())
+          .filter((provider) => provider.length > 0);
+        if (normalized.length > 0) {
+          validated.disabled_model_providers = Array.from(new Set(normalized));
+        }
+      }
+    } else {
+      errors.push("disabled_model_providers must be an array of strings");
     }
   }
 
@@ -987,6 +1017,27 @@ export function validatePreferences(preferences: GSDPreferences): {
     if (g.merge_to_main !== undefined) {
       warnings.push("git.merge_to_main is deprecated — milestone-level merge is now always used. Remove this setting.");
     }
+    // #4765 — collapse cadence + milestone resquash
+    if (g.collapse_cadence !== undefined) {
+      const validCadence = new Set(["milestone", "slice"]);
+      if (typeof g.collapse_cadence === "string" && validCadence.has(g.collapse_cadence)) {
+        git.collapse_cadence = g.collapse_cadence as "milestone" | "slice";
+      } else {
+        errors.push("git.collapse_cadence must be one of: milestone, slice");
+      }
+    }
+    if (g.milestone_resquash !== undefined) {
+      if (typeof g.milestone_resquash === "boolean") {
+        git.milestone_resquash = g.milestone_resquash;
+        const cadence = (git.collapse_cadence as string | undefined)
+          ?? (typeof g.collapse_cadence === "string" ? g.collapse_cadence : undefined);
+        if (cadence !== "slice") {
+          warnings.push('git.milestone_resquash is ignored unless git.collapse_cadence is "slice"');
+        }
+      } else {
+        errors.push("git.milestone_resquash must be a boolean");
+      }
+    }
 
     if (Object.keys(git).length > 0) {
       validated.git = git as GitPreferences;
@@ -1077,6 +1128,20 @@ export function validatePreferences(preferences: GSDPreferences): {
       validated.show_token_cost = preferences.show_token_cost;
     } else {
       errors.push("show_token_cost must be a boolean");
+    }
+  }
+
+  // ─── Auto-Mode Request Interval ───────────────────────────────────
+  if (preferences.min_request_interval_ms !== undefined) {
+    if (
+      typeof preferences.min_request_interval_ms === "number" &&
+      Number.isFinite(preferences.min_request_interval_ms) &&
+      preferences.min_request_interval_ms >= 0 &&
+      preferences.min_request_interval_ms <= 2_147_483_647
+    ) {
+      validated.min_request_interval_ms = Math.floor(preferences.min_request_interval_ms);
+    } else {
+      errors.push("min_request_interval_ms must be a non-negative number <= 2147483647");
     }
   }
 

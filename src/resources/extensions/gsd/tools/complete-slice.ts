@@ -4,7 +4,8 @@
  * Validates inputs, checks all tasks are complete, writes slice row to DB in
  * a transaction, then (outside the transaction) renders SUMMARY.md + UAT.md
  * to disk, toggles the roadmap checkbox, stores rendered markdown in DB for
- * D004 recovery, and invalidates caches.
+ * D004 recovery, and invalidates caches. Projection write failures are stale
+ * projection diagnostics and do not roll back committed DB state.
  */
 
 import { join } from "node:path";
@@ -30,6 +31,7 @@ import { checkOwnership, sliceUnitKey } from "../unit-ownership.js";
 import { saveFile, clearParseCache } from "../files.js";
 import { invalidateStateCache } from "../state.js";
 import { renderRoadmapCheckboxes } from "../markdown-renderer.js";
+import { isStaleWrite } from "../auto/turn-epoch.js";
 import { renderAllProjections } from "../workflow-projections.js";
 import { writeManifest } from "../workflow-manifest.js";
 import { appendEvent } from "../workflow-events.js";
@@ -40,6 +42,14 @@ export interface CompleteSliceResult {
   milestoneId: string;
   summaryPath: string;
   uatPath: string;
+  /**
+   * True when this call re-completed an already-closed slice from a turn
+   * superseded by timeout recovery or cancellation. Response is shaped like
+   * success so the orphaned LLM tool call unwinds cleanly without mutating
+   * state.
+   */
+  duplicate?: boolean;
+  stale?: boolean;
 }
 
 /**
@@ -268,7 +278,6 @@ export async function handleCompleteSlice(
 
   // ── Guards + DB writes inside a single transaction (prevents TOCTOU) ───
   const completedAt = new Date().toISOString();
-  const originalSliceStatus = getSlice(params.milestoneId, params.sliceId)?.status ?? "pending";
   let guardError: string | null = null;
 
   transaction(() => {
@@ -283,6 +292,10 @@ export async function handleCompleteSlice(
 
     const slice = getSlice(params.milestoneId, params.sliceId);
     if (slice && isClosedStatus(slice.status)) {
+      if (isStaleWrite("complete-slice")) {
+        guardError = "__stale_duplicate__";
+        return;
+      }
       guardError = `slice ${params.sliceId} is already complete — use gsd_slice_reopen first if you need to redo it`;
       return;
     }
@@ -307,13 +320,34 @@ export async function handleCompleteSlice(
     updateSliceStatus(params.milestoneId, params.sliceId, "complete", completedAt);
   });
 
+  if (guardError === "__stale_duplicate__") {
+    // Stale duplicate from a turn superseded by timeout recovery. Return a
+    // non-mutating success so the orphaned LLM tool call unwinds quietly.
+    const sliceDir = resolveSlicePath(basePath, params.milestoneId, params.sliceId);
+    const staleSummaryPath = sliceDir
+      ? join(sliceDir, `${params.sliceId}-SUMMARY.md`)
+      : join(
+          basePath,
+          ".gsd",
+          "milestones",
+          params.milestoneId,
+          "slices",
+          params.sliceId,
+          `${params.sliceId}-SUMMARY.md`,
+        );
+    return {
+      sliceId: params.sliceId,
+      milestoneId: params.milestoneId,
+      summaryPath: staleSummaryPath,
+      uatPath: staleSummaryPath.replace(/-SUMMARY\.md$/, "-UAT.md"),
+      duplicate: true,
+      stale: true,
+    };
+  }
+
   if (guardError) {
     return { error: guardError };
   }
-
-  // ── Filesystem operations (outside transaction) ─────────────────────────
-  // If disk render fails, roll back the DB status so deriveState() and
-  // verifyExpectedArtifact() stay consistent (both say "not done").
 
   // Render summary markdown
   const summaryMd = renderSliceSummaryMarkdown(params);
@@ -333,6 +367,8 @@ export async function handleCompleteSlice(
 
   const uatMd = renderUatMarkdown(params);
   const uatPath = summaryPath.replace(/-SUMMARY\.md$/, "-UAT.md");
+  setSliceSummaryMd(params.milestoneId, params.sliceId, summaryMd, uatMd);
+  let projectionStale = false;
 
   try {
     await saveFile(summaryPath, summaryMd);
@@ -344,15 +380,9 @@ export async function handleCompleteSlice(
       logWarning("tool", `complete_slice — could not find roadmap for ${params.milestoneId}, skipping checkbox toggle`);
     }
   } catch (renderErr) {
-    // Disk render failed — roll back DB status so state stays consistent
-    logWarning("tool", `complete_slice — disk render failed for ${params.milestoneId}/${params.sliceId}, rolling back DB status`, { error: (renderErr as Error).message });
-    updateSliceStatus(params.milestoneId, params.sliceId, originalSliceStatus);
-    invalidateStateCache();
-    return { error: `disk render failed: ${(renderErr as Error).message}` };
+    projectionStale = true;
+    logWarning("projection", `complete_slice projection write failed for ${params.milestoneId}/${params.sliceId}; DB completion remains committed`, { error: (renderErr as Error).message });
   }
-
-  // Store rendered markdown in DB for D004 recovery
-  setSliceSummaryMd(params.milestoneId, params.sliceId, summaryMd, uatMd);
 
   // ── Close gates owned by complete-slice (Q8) ───────────────────────────
   // Each owned gate maps to a specific summary section via the registry.
@@ -455,5 +485,6 @@ export async function handleCompleteSlice(
     milestoneId: params.milestoneId,
     summaryPath,
     uatPath,
+    ...(projectionStale ? { stale: true } : {}),
   };
 }

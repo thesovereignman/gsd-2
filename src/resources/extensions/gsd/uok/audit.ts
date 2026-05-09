@@ -1,10 +1,14 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+// GSD2 UOK Audit Events and DB-First Projection Writes
+
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { isStaleWrite } from "../auto/turn-epoch.js";
+import { withFileLockSync } from "../file-lock.js";
 import { gsdRoot } from "../paths.js";
 import { isDbAvailable, insertAuditEvent } from "../gsd-db.js";
-import type { AuditEventEnvelope } from "./contracts.js";
+import { CURRENT_UOK_CONTRACT_VERSION, validateAuditEvent, type AuditEventEnvelope } from "./contracts.js";
 
 function auditLogPath(basePath: string): string {
   return join(gsdRoot(basePath), "audit", "events.jsonl");
@@ -23,6 +27,7 @@ export function buildAuditEnvelope(args: {
   payload?: Record<string, unknown>;
 }): AuditEventEnvelope {
   return {
+    version: CURRENT_UOK_CONTRACT_VERSION,
     eventId: randomUUID(),
     traceId: args.traceId,
     turnId: args.turnId,
@@ -35,17 +40,46 @@ export function buildAuditEnvelope(args: {
 }
 
 export function emitUokAuditEvent(basePath: string, event: AuditEventEnvelope): void {
-  try {
-    ensureAuditDir(basePath);
-    appendFileSync(auditLogPath(basePath), `${JSON.stringify(event)}\n`, "utf-8");
-  } catch {
-    // Best-effort: audit writes must never break orchestration.
+  // Drop writes from a turn superseded by timeout recovery / cancellation.
+  if (isStaleWrite("uok-audit")) return;
+  const validation = validateAuditEvent(event);
+  if (!validation.ok) {
+    throw new Error(`Invalid UOK audit event: ${validation.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`);
+  }
+  const canonical = validation.value;
+
+  if (isDbAvailable()) {
+    try {
+      insertAuditEvent({
+        ...canonical,
+        payload: {
+          ...canonical.payload,
+          contractVersion: canonical.version ?? CURRENT_UOK_CONTRACT_VERSION,
+        },
+      });
+    } catch (err) {
+      throw new Error(`DB authoritative audit write failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
-  if (!isDbAvailable()) return;
   try {
-    insertAuditEvent(event);
+    ensureAuditDir(basePath);
+    const path = auditLogPath(basePath);
+    // proper-lockfile requires the target file to exist before locking.
+    // Touch it via open(O_APPEND|O_CREAT) so the first writer wins the race
+    // atomically at the kernel level.
+    if (!existsSync(path)) closeSync(openSync(path, "a"));
+    // onLocked: "skip" — audit writes are best-effort; under heavy contention
+    // POSIX O_APPEND atomicity still protects small line writes, so skipping
+    // the lock rather than stalling orchestration is the correct tradeoff.
+    withFileLockSync(
+      path,
+      () => {
+        appendFileSync(path, `${JSON.stringify(canonical)}\n`, "utf-8");
+      },
+      { onLocked: "skip" },
+    );
   } catch {
-    // Projection failures are non-fatal while legacy readers are still active.
+    // Best-effort: audit writes must never break orchestration.
   }
 }

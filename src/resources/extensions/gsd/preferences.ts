@@ -21,6 +21,7 @@ import type { DynamicRoutingConfig } from "./model-router.js";
 import { normalizeStringArray } from "../shared/format-utils.js";
 import { logWarning } from "./workflow-logger.js";
 import { resolveProfileDefaults as _resolveProfileDefaults } from "./preferences-models.js";
+import { nativeHasCommittedHead, nativeIsRepo } from "./native-git-bridge.js";
 
 import {
   KNOWN_PREFERENCE_KEYS,
@@ -33,6 +34,7 @@ import {
   formatSkillRef,
 } from "./preferences-types.js";
 import { validatePreferences } from "./preferences-validation.js";
+import { gsdHome } from "./gsd-home.js";
 
 // ─── Re-exports: types ──────────────────────────────────────────────────────
 // Every type/interface that was previously exported from this file is
@@ -89,17 +91,15 @@ export {
   resolveDynamicRoutingConfig,
   resolveAutoSupervisorConfig,
   resolveProfileDefaults,
+  getProfileTierMap,
   resolveEffectiveProfile,
   resolveInlineLevel,
   resolveContextSelection,
   resolveSearchProviderFromPreferences,
+  resolveDisabledModelProvidersFromPreferences,
 } from "./preferences-models.js";
 
 // ─── Path Constants & Getters ───────────────────────────────────────────────
-
-function gsdHome(): string {
-  return process.env.GSD_HOME || join(homedir(), ".gsd");
-}
 
 function globalPreferencesPath(): string {
   return join(gsdHome(), "PREFERENCES.md");
@@ -146,9 +146,13 @@ export function loadProjectGSDPreferences(basePath?: string): LoadedGSDPreferenc
     ?? loadPreferencesFile(legacyProjectPreferencesPathLowercase(basePath), "project");
 }
 
-export function loadEffectiveGSDPreferences(basePath?: string): LoadedGSDPreferences | null {
+export function loadEffectiveGSDPreferences(
+  basePath?: string,
+  opts?: { availableModelIds?: string[] },
+): LoadedGSDPreferences | null {
   const globalPreferences = loadGlobalGSDPreferences();
   const projectPreferences = loadProjectGSDPreferences(basePath);
+  const projectHasPlanningDepth = projectPreferences?.preferences.planning_depth !== undefined;
 
   if (!globalPreferences && !projectPreferences) return null;
 
@@ -175,7 +179,11 @@ export function loadEffectiveGSDPreferences(basePath?: string): LoadedGSDPrefere
   // Explicit user preferences always override profile defaults.
   const profile = result.preferences.token_profile as TokenProfile | undefined;
   if (profile) {
-    const profileDefaults = _resolveProfileDefaults(profile);
+    const profileDefaults = _resolveProfileDefaults(
+      profile,
+      opts?.availableModelIds,
+      result.preferences.dynamic_routing,
+    );
     result = {
       ...result,
       preferences: mergePreferences(profileDefaults as GSDPreferences, result.preferences),
@@ -190,7 +198,25 @@ export function loadEffectiveGSDPreferences(basePath?: string): LoadedGSDPrefere
     };
   }
 
+  result = stripInheritedPlanningDepth(result, projectHasPlanningDepth);
+
   return result;
+}
+
+function stripInheritedPlanningDepth(
+  loaded: LoadedGSDPreferences,
+  projectHasPlanningDepth: boolean,
+): LoadedGSDPreferences {
+  if (projectHasPlanningDepth || loaded.preferences.planning_depth === undefined) {
+    return loaded;
+  }
+
+  // planning_depth is a project bootstrap routing flag, not a user-global
+  // preference. A global ~/.gsd/PREFERENCES.md value should not make every
+  // fresh repo behave like `/gsd new-project --deep`.
+  const preferences: GSDPreferences = { ...loaded.preferences };
+  delete preferences.planning_depth;
+  return { ...loaded, preferences };
 }
 
 function loadPreferencesFile(path: string, scope: "global" | "project"): LoadedGSDPreferences | null {
@@ -380,6 +406,10 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     dynamic_routing: (base.dynamic_routing || override.dynamic_routing)
       ? { ...(base.dynamic_routing ?? {}), ...(override.dynamic_routing ?? {}) } as DynamicRoutingConfig
       : undefined,
+    disabled_model_providers: mergeStringLists(
+      base.disabled_model_providers,
+      override.disabled_model_providers,
+    ),
     uok: (base.uok || override.uok)
       ? {
           enabled: override.uok?.enabled ?? base.uok?.enabled,
@@ -433,6 +463,7 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     service_tier: override.service_tier ?? base.service_tier,
     forensics_dedup: override.forensics_dedup ?? base.forensics_dedup,
     show_token_cost: override.show_token_cost ?? base.show_token_cost,
+    min_request_interval_ms: override.min_request_interval_ms ?? base.min_request_interval_ms,
     codebase: (base.codebase || override.codebase)
       ? {
           ...(base.codebase ?? {}),
@@ -448,6 +479,7 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
       ? { ...(base.slice_parallel ?? {}), ...(override.slice_parallel ?? {}) }
       : undefined,
     language: override.language ?? base.language,
+    planning_depth: override.planning_depth ?? base.planning_depth,
   };
 }
 
@@ -605,7 +637,10 @@ export function resolvePreDispatchHooks(): PreDispatchHookConfig[] {
  */
 export function getIsolationMode(basePath?: string): "none" | "worktree" | "branch" {
   const prefs = loadEffectiveGSDPreferences(basePath)?.preferences?.git;
-  if (prefs?.isolation === "worktree") return "worktree";
+  if (prefs?.isolation === "worktree") {
+    if (basePath && nativeIsRepo(basePath) && !nativeHasCommittedHead(basePath)) return "none";
+    return "worktree";
+  }
   if (prefs?.isolation === "branch") return "branch";
   return "none"; // default — no isolation, work on current branch
 }

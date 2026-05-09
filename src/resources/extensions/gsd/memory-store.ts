@@ -7,6 +7,7 @@ import {
   isDbAvailable,
   _getAdapter,
   transaction,
+  isInTransaction,
   insertMemoryRow,
   rewriteMemoryId,
   updateMemoryContentRow,
@@ -19,6 +20,7 @@ import {
   deleteMemoryRelationsFor,
 } from './gsd-db.js';
 import { createMemoryRelation, isValidRelation } from './memory-relations.js';
+import { logWarning } from './workflow-logger.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +44,8 @@ export interface Memory {
    * decisions table (Step 5) with the original scope/decision/choice/etc.
    */
   structured_fields: Record<string, unknown> | null;
+  /** ISO timestamp of the most recent memory_query hit. NULL until first hit. */
+  last_hit_at: string | null;
 }
 
 export type MemoryActionCreate = {
@@ -98,6 +102,27 @@ const CATEGORY_PRIORITY: Record<string, number> = {
   preference: 5,
 };
 
+// ─── Scoring Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Time-decay factor for memory relevance scoring.
+ * Returns 1.0 for never-hit or recently-hit memories, decaying linearly to
+ * 0.7 for memories not accessed in 90+ days. Floor at 0.7 keeps old-but-valid
+ * knowledge from being fully suppressed.
+ *
+ * Defensive parsing: invalid timestamp strings (NaN from Date.parse) are
+ * treated as "no decay" rather than propagating NaN into score arithmetic.
+ * Future timestamps (clock skew, manual DB edits) clamp to daysAgo=0 so the
+ * factor stays in the documented [0.7, 1.0] contract.
+ */
+export function memoryDecayFactor(lastHitAt: string | null): number {
+  if (!lastHitAt) return 1.0;
+  const ts = Date.parse(lastHitAt);
+  if (!Number.isFinite(ts)) return 1.0;
+  const daysAgo = Math.max(0, (Date.now() - ts) / 86_400_000);
+  return Math.max(0.7, 1.0 - 0.3 * Math.min(1.0, daysAgo / 90));
+}
+
 // ─── Row Mapping ────────────────────────────────────────────────────────────
 
 function rowToMemory(row: Record<string, unknown>): Memory {
@@ -116,6 +141,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     scope: (row['scope'] as string) ?? 'project',
     tags: parseTags(row['tags']),
     structured_fields: parseStructuredFields(row['structured_fields']),
+    last_hit_at: (row['last_hit_at'] as string | null) ?? null,
   };
 }
 
@@ -231,15 +257,39 @@ export function queryMemoriesRanked(opts: QueryMemoriesOptions): RankedMemory[] 
     : [];
 
   if (keywordHits.length === 0 && semanticHits.length === 0 && !trimmedQuery) {
-    // No query at all — fall back to the existing ranked-by-score listing.
-    return getActiveMemoriesRanked(k).map((memory) => ({
-      memory,
-      score: memory.confidence * (1 + memory.hit_count * 0.1),
-      keywordRank: null,
-      semanticRank: null,
-      confidenceBoost: memory.confidence * (1 + memory.hit_count * 0.1),
-      reason: 'ranked' as const,
-    })).filter((hit) => passesFilters(hit.memory, opts));
+    // No query at all — return top-k by decay-aware ranked score.
+    //
+    // Build the candidate pool from a direct SQL query that honors the
+    // request's activeClause (i.e. include_superseded). Using
+    // getActiveMemoriesRanked here would silently drop superseded rows even
+    // when the caller explicitly opted in, and would slice by raw score
+    // before decay/filters had a chance to reorder.
+    const candidatePool = Math.min(Math.max(k * 5, 50), 500);
+    const rows = adapter
+      .prepare(
+        `SELECT * FROM memories ${activeClause}
+         ORDER BY (confidence * (1.0 + hit_count * 0.1)) DESC
+         LIMIT :limit`,
+      )
+      .all({ ':limit': candidatePool });
+
+    const ranked: RankedMemory[] = [];
+    for (const row of rows) {
+      const memory = rowToMemory(row);
+      if (!passesFilters(memory, opts)) continue;
+      const decay = memoryDecayFactor(memory.last_hit_at);
+      const score = memory.confidence * (1 + memory.hit_count * 0.1) * decay;
+      ranked.push({
+        memory,
+        score,
+        keywordRank: null,
+        semanticRank: null,
+        confidenceBoost: score,
+        reason: 'ranked' as const,
+      });
+    }
+    ranked.sort((a, b) => b.score - a.score);
+    return ranked.slice(0, k);
   }
 
   // 3) Reciprocal rank fusion — each hit contributes 1/(rrfK + rank).
@@ -273,7 +323,7 @@ export function queryMemoriesRanked(opts: QueryMemoriesOptions): RankedMemory[] 
   const ranked: RankedMemory[] = [];
   for (const entry of fused.values()) {
     if (!passesFilters(entry.memory, opts)) continue;
-    const boost = entry.memory.confidence * (1 + entry.memory.hit_count * 0.1);
+    const boost = entry.memory.confidence * (1 + entry.memory.hit_count * 0.1) * memoryDecayFactor(entry.memory.last_hit_at);
     const reason: RankedMemory['reason'] =
       entry.kwRank != null && entry.semRank != null
         ? 'both'
@@ -311,6 +361,8 @@ function passesFilters(memory: Memory, filters: QueryMemoriesFilters): boolean {
   return true;
 }
 
+let ftsWarningEmitted = false;
+
 function keywordSearch(
   adapter: NonNullable<ReturnType<typeof _getAdapter>>,
   rawQuery: string,
@@ -338,14 +390,29 @@ function keywordSearch(
     }
   }
 
-  // LIKE fallback — scans the candidate pool.
+  // LIKE fallback — scans a capped candidate pool.
+  if (!ftsWarningEmitted) {
+    ftsWarningEmitted = true;
+    logWarning('memory-store', 'FTS5 unavailable — using LIKE fallback scan (consider enabling FTS5)');
+  }
+
   const terms = rawQuery
     .toLowerCase()
     .split(/[^a-z0-9_]+/)
     .filter((t) => t.length >= 2);
   if (terms.length === 0) return [];
 
-  const rows = adapter.prepare(`SELECT * FROM memories ${activeClause}`).all();
+  const preScanCap = Math.min(limit * 20, 2000);
+  // ORDER BY confidence-weighted hit_count DESC so the cap keeps the most
+  // valuable candidates instead of the oldest-by-rowid (which would silently
+  // exclude recently-stored memories on tables larger than preScanCap).
+  const rows = adapter
+    .prepare(
+      `SELECT * FROM memories ${activeClause}
+       ORDER BY (confidence * (1.0 + hit_count * 0.1)) DESC
+       LIMIT :preScanCap`,
+    )
+    .all({ ':preScanCap': preScanCap });
   const scored: Array<{ memory: Memory; score: number }> = [];
   for (const row of rows) {
     const memory = rowToMemory(row);
@@ -487,7 +554,13 @@ export function nextMemoryId(): string {
  * Insert a new memory with a race-safe auto-assigned ID.
  * Uses AUTOINCREMENT seq to derive the ID after insert, avoiding
  * the read-then-write race in concurrent scenarios (e.g. worktrees).
- * Returns the assigned ID, or null on failure.
+ * Returns the assigned ID, or null when the DB is unavailable.
+ *
+ * Throws on genuine SQL errors (corruption, missing tables, constraint
+ * violations) so callers can surface the underlying message instead of
+ * collapsing the failure to a generic "create_failed". See issue #4967 —
+ * the previous bare-catch swallowed "database disk image is malformed"
+ * errors, leaving the memory subsystem broken without any signal.
  */
 export function createMemory(fields: {
   category: string;
@@ -504,32 +577,68 @@ export function createMemory(fields: {
   if (!adapter) return null;
 
   try {
-    const now = new Date().toISOString();
-    // Insert with a temporary placeholder ID — seq is auto-assigned
-    const placeholder = `_TMP_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    insertMemoryRow({
-      id: placeholder,
-      category: fields.category,
-      content: fields.content,
-      confidence: fields.confidence ?? 0.8,
-      sourceUnitType: fields.source_unit_type ?? null,
-      sourceUnitId: fields.source_unit_id ?? null,
-      createdAt: now,
-      updatedAt: now,
-      scope: fields.scope ?? 'project',
-      tags: fields.tags ?? [],
-      structuredFields: fields.structuredFields ?? null,
-    });
-    // Derive the real ID from the assigned seq (SELECT is still fine via adapter)
-    const row = adapter.prepare('SELECT seq FROM memories WHERE id = :id').get({ ':id': placeholder });
-    if (!row) return placeholder; // fallback — should not happen
-    const seq = row['seq'] as number;
-    const realId = `MEM${String(seq).padStart(3, '0')}`;
-    rewriteMemoryId(placeholder, realId);
-    return realId;
-  } catch {
-    return null;
+    return transaction(() => doCreateMemory(adapter, fields));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+
+    // Targeted recovery: a malformed memory store can sometimes be rebuilt
+    // by VACUUM. Skip when inside a transaction — SQLite refuses VACUUM
+    // there and a secondary throw would mask the real fault.
+    if (message.toLowerCase().includes('malformed') && !isInTransaction()) {
+      try {
+        adapter.prepare('VACUUM').run();
+        const recoveryMessage = 'recovered malformed memory store via VACUUM';
+        process.stderr.write(`memory-store: ${recoveryMessage}\n`);
+        logWarning('memory-store', recoveryMessage);
+        return transaction(() => doCreateMemory(adapter, fields));
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        logWarning('memory-store', `VACUUM recovery for memory store failed: ${retryMsg}`);
+        // Surface the *original* malformed error — it's the actionable signal.
+        throw err;
+      }
+    }
+
+    throw err;
   }
+}
+
+function doCreateMemory(
+  adapter: NonNullable<ReturnType<typeof _getAdapter>>,
+  fields: {
+    category: string;
+    content: string;
+    confidence?: number;
+    source_unit_type?: string;
+    source_unit_id?: string;
+    scope?: string;
+    tags?: string[];
+    structuredFields?: Record<string, unknown> | null;
+  },
+): string {
+  const now = new Date().toISOString();
+  // Insert with a temporary placeholder ID — seq is auto-assigned
+  const placeholder = `_TMP_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  insertMemoryRow({
+    id: placeholder,
+    category: fields.category,
+    content: fields.content,
+    confidence: fields.confidence ?? 0.8,
+    sourceUnitType: fields.source_unit_type ?? null,
+    sourceUnitId: fields.source_unit_id ?? null,
+    createdAt: now,
+    updatedAt: now,
+    scope: fields.scope ?? 'project',
+    tags: fields.tags ?? [],
+    structuredFields: fields.structuredFields ?? null,
+  });
+  // Derive the real ID from the assigned seq (SELECT is still fine via adapter)
+  const row = adapter.prepare('SELECT seq FROM memories WHERE id = :id').get({ ':id': placeholder });
+  if (!row) return placeholder; // fallback — should not happen
+  const seq = row['seq'] as number;
+  const realId = `MEM${String(seq).padStart(3, '0')}`;
+  rewriteMemoryId(placeholder, realId);
+  return realId;
 }
 
 /**
@@ -728,8 +837,17 @@ export function applyMemoryActions(
       }
       enforceMemoryCap();
     });
-  } catch {
-    // non-fatal — transaction will have rolled back
+  } catch (err) {
+    // Non-fatal — the transaction has rolled back. We log a warning so a
+    // degraded memory subsystem (e.g. malformed store, missing tables) is
+    // visible to forensics instead of silently dropping every CREATE — see
+    // issue #4967, where this swallow combined with createMemory's bare
+    // catch hid SQLite corruption from the auto-mode flow entirely.
+    const message = err instanceof Error ? err.message : String(err);
+    logWarning(
+      'memory-store',
+      `applyMemoryActions failed (memory subsystem degraded): ${message}`,
+    );
   }
 }
 

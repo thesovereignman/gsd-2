@@ -42,11 +42,34 @@ function readGsdState(): GsdState | undefined {
   }
 }
 
+function countMcpServers(): number {
+  const configPaths = [
+    join(process.cwd(), '.mcp.json'),
+    join(process.cwd(), '.gsd', 'mcp.json'),
+  ]
+  const seen = new Set<string>()
+  for (const p of configPaths) {
+    try {
+      const raw = readFileSync(p, 'utf-8')
+      const data = JSON.parse(raw) as Record<string, unknown>
+      const servers = (data.mcpServers ?? data.servers) as
+        | Record<string, unknown>
+        | undefined
+      if (!servers || typeof servers !== 'object') continue
+      for (const name of Object.keys(servers)) seen.add(name)
+    } catch {
+      // missing or malformed config — ignore
+    }
+  }
+  return seen.size
+}
+
 export interface WelcomeScreenOptions {
   version: string
   modelName?: string
   provider?: string
   remoteChannel?: string
+  width?: number
 }
 
 function getShortCwd(): string {
@@ -65,17 +88,14 @@ function rpad(s: string, w: number): string {
   return s + ' '.repeat(Math.max(0, w - visLen(s)))
 }
 
-export function printWelcomeScreen(opts: WelcomeScreenOptions): void {
-  if (!process.stderr.isTTY) return
-
+export function buildWelcomeScreenLines(opts: WelcomeScreenOptions): string[] {
   const { version, remoteChannel } = opts
   const shortCwd = getShortCwd()
-  const termWidth = (process.stderr.columns || 80) - 1
+  const termWidth = Math.max(1, (opts.width ?? process.stderr.columns ?? 80) - 1)
 
   // Narrow terminal fallback
   if (termWidth < 70) {
-    process.stderr.write(`\n  Get Shit Done v${version}\n  ${shortCwd}\n\n`)
-    return
+    return ['', `  Get Shit Done v${version}`, `  ${shortCwd}`, '']
   }
 
   // ── Panel widths ────────────────────────────────────────────────────────────
@@ -133,13 +153,18 @@ export function printWelcomeScreen(opts: WelcomeScreenOptions): void {
   const sessionLine = line1
   const projectLine = line2
 
+  const mcpCount = countMcpServers()
+  const mcpLine = mcpCount > 0
+    ? `  MCP        ${chalk.dim(`${mcpCount} server${mcpCount === 1 ? '' : 's'} configured`)}`
+    : ''
+
   const DIVIDER = null
   const rightRows: (string | null)[] = [
     titleRow,
     DIVIDER,
-    '',
     sessionLine,
     projectLine,
+    mcpLine,
     '',
     DIVIDER,
     footerRow,
@@ -169,5 +194,10 @@ export function printWelcomeScreen(opts: WelcomeScreenOptions): void {
   out.push(chalk.cyan(H.repeat(termWidth)))
   out.push('')
 
-  process.stderr.write(out.join('\n') + '\n')
+  return out
+}
+
+export function printWelcomeScreen(opts: WelcomeScreenOptions): void {
+  if (!process.stderr.isTTY) return
+  process.stderr.write(buildWelcomeScreenLines(opts).join('\n') + '\n')
 }

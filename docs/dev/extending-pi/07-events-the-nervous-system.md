@@ -32,6 +32,13 @@ Events are the core of the extension system. They fall into five categories:
 | `context` | Before each LLM call | `{ messages: [...] }` (modified copy) |
 | `message_start/update/end` | Message lifecycle | — |
 
+Agent lifecycle, turn, and message events may include optional `sessionId` and
+`turnId` fields for correlating events from the same session turn. `agent_end`
+and `stop` may also include `abortOrigin`, one of `"session-transition"`,
+`"user"`, `"timeout"`, or `"unknown"`. Treat `"session-transition"` as internal
+session-control flow rather than a user/provider failure when settling work from
+`agent_end`.
+
 ### 7.3 Tool Events
 
 | Event | When | Can Return |
@@ -128,7 +135,7 @@ pi.on("event_name", async (event, ctx: ExtensionContext) => {
 ### Type Narrowing for Tool Events
 
 ```typescript
-import { isToolCallEventType, isToolResultEventType } from "@mariozechner/pi-coding-agent";
+import { isToolCallEventType, isToolResultEventType } from "@gsd/pi-coding-agent";
 
 pi.on("tool_call", async (event, ctx) => {
   if (isToolCallEventType("bash", event)) {

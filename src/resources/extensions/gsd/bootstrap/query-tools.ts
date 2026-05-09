@@ -1,10 +1,11 @@
+// Project/App: GSD-2
+// File Purpose: Registers read-only DB query tools.
 // GSD2 — Read-only query tools exposing DB state to the LLM via the WAL connection
 
 import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
-import { ensureDbOpen } from "./dynamic-tools.js";
-import { executeMilestoneStatus } from "../tools/workflow-tool-executors.js";
-import { checkpointDatabase } from "../gsd-db.js";
+import { ensureDbOpen, resolveCtxCwd } from "./dynamic-tools.js";
+
 
 export function registerQueryTools(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -22,13 +23,14 @@ export function registerQueryTools(pi: ExtensionAPI): void {
       milestoneId: Type.String({ description: "Milestone ID to query (e.g. M001)" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const dbAvailable = await ensureDbOpen();
+      const dbAvailable = await ensureDbOpen(resolveCtxCwd(_ctx));
       if (!dbAvailable) {
         return {
           content: [{ type: "text", text: "Error: GSD database is not available. Cannot read milestone status." }],
           details: { operation: "milestone_status", error: "db_unavailable" },
         };
       }
+      const { executeMilestoneStatus } = await import("../tools/workflow-tool-executors.js");
       return executeMilestoneStatus(params);
     },
   });
@@ -48,13 +50,14 @@ export function registerQueryTools(pi: ExtensionAPI): void {
     ],
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const dbAvailable = await ensureDbOpen();
+      const dbAvailable = await ensureDbOpen(resolveCtxCwd(_ctx));
       if (!dbAvailable) {
         return {
           content: [{ type: "text", text: "Error: GSD database is not available. Cannot checkpoint." }],
           details: { operation: "checkpoint_db", error: "db_unavailable" },
         };
       }
+      const { checkpointDatabase } = await import("../gsd-db.js");
       checkpointDatabase();
       return {
         content: [{ type: "text", text: "WAL checkpoint complete. gsd.db is now up to date and safe to stage with git add." }],

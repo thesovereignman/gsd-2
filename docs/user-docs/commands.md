@@ -26,11 +26,13 @@
 | `/gsd history` | View execution history (supports `--cost`, `--phase`, `--model` filters) |
 | `/gsd forensics` | Full-access GSD debugger — structured anomaly detection, unit traces, and LLM-guided root-cause analysis for auto-mode failures |
 | `/gsd cleanup` | Clean up GSD state files and stale worktrees |
+| `/gsd worktree` (`/gsd wt`) | Manage GSD worktrees from the TUI |
 | `/gsd visualize` | Open workflow visualizer (progress, deps, metrics, timeline) |
 | `/gsd export --html` | Generate self-contained HTML report for current or completed milestone |
 | `/gsd export --html --all` | Generate retrospective reports for all milestones at once |
 | `/gsd update` | Update GSD to the latest version in-session |
 | `/gsd knowledge` | Add persistent project knowledge (rule, pattern, or lesson) |
+| `/gsd eval-review <sliceId>` | Audit a slice's AI evaluation strategy and write a scored `<sliceId>-EVAL-REVIEW.md`. Flags: `--force` overwrites; `--show` prints the existing audit. See [eval-review](eval-review.md). |
 | `/gsd extract-learnings <MID>` | Extract structured Decisions, Lessons, Patterns, and Surprises from a completed milestone — writes `<MID>-LEARNINGS.md` audit trail, appends Patterns and Lessons to `.gsd/KNOWLEDGE.md`, and persists Decisions via the DECISIONS database. Runs automatically at milestone completion. |
 | `/gsd fast` | Toggle service tier for supported models (prioritized API routing) |
 | `/gsd rate` | Rate last unit's model tier (over/ok/under) — improves adaptive routing |
@@ -58,12 +60,14 @@
 | `/gsd hooks` | Show configured post-unit and pre-dispatch hooks |
 | `/gsd run-hook` | Manually trigger a specific hook |
 | `/gsd migrate` | Migrate a v1 `.planning` directory to `.gsd` format |
+| `/gsd recover` | Explicitly reset database hierarchy plus persisted validation and quality-gate state, then reconstruct from rendered markdown after database loss or corruption |
 
 ## Milestone Management
 
 | Command | Description |
 |---------|-------------|
-| `/gsd new-milestone` | Create a new milestone |
+| `/gsd new-project [--deep]` | Bootstrap a new project; `--deep` enables staged project-level discovery |
+| `/gsd new-milestone [--deep]` | Create a new milestone; `--deep` opts the project into deep planning mode |
 | `/gsd skip` | Prevent a unit from auto-mode dispatch |
 | `/gsd undo` | Revert last completed unit |
 | `/gsd undo-task` | Reset a specific task's completion state (DB + markdown) |
@@ -154,10 +158,16 @@ Plugins are plain YAML (`.yaml`) or markdown (`.md`) files. See
 
 | Command | Description |
 |---------|-------------|
-| `/gsd extensions list` | List all extensions and their status |
+| `/gsd extensions list` | List all extensions and their status. User-installed entries show `[user]` plus the install source |
 | `/gsd extensions enable <id>` | Enable a disabled extension |
 | `/gsd extensions disable <id>` | Disable an extension |
 | `/gsd extensions info <id>` | Show extension details |
+| `/gsd extensions install <spec>` | Install a user extension. `<spec>` is an npm package, a git URL, or a local path. Restart GSD to activate. (v2.78) |
+| `/gsd extensions uninstall <id>` | Remove a user-installed extension. Warns if other extensions depend on it. (v2.78) |
+| `/gsd extensions update [id]` | Update a single user-installed npm extension to its latest version, or all of them when `id` is omitted. Git/local installs are skipped — reinstall to update. (v2.78) |
+| `/gsd extensions validate <path>` | Validate an extension package directory against the manifest schema before publishing or installing. (v2.78) |
+
+Install sources are auto-detected: starts with `http(s)://` or ends with `.git` → git clone; contains `/` or `.` and exists on disk → local copy; otherwise → `npm pack`. Installed extensions land in `~/.gsd/extensions/<id>/` and the registry records the source so `update` can re-fetch.
 
 ## cmux Integration
 
@@ -184,6 +194,24 @@ Enable with `github.enabled: true` in preferences. Requires `gh` CLI installed a
 | Command | Description |
 |---------|-------------|
 | `/worktree` (`/wt`) | Git worktree lifecycle — create, switch, merge, remove |
+
+## GSD Worktree Commands
+
+Use `/gsd worktree` from an active TUI session to inspect and clean up GSD-managed worktrees without leaving the conversation. `/gsd wt` is an alias.
+
+| Command | Description |
+|---------|-------------|
+| `/gsd worktree list` | Show each worktree, branch, path, clean/unmerged/uncommitted status, diff stats, and commit count. Alias: `/gsd worktree ls`. |
+| `/gsd worktree merge [name]` | Merge a worktree into the detected main branch, then remove the worktree and its branch. The name is optional only when exactly one worktree exists. |
+| `/gsd worktree clean` | Remove only merged or empty worktrees. Worktrees with unmerged diffs or uncommitted changes are kept. |
+| `/gsd worktree remove <name> [--force]` | Remove a named worktree and delete its branch. Refuses unmerged or uncommitted work unless `--force` is supplied. Alias: `/gsd worktree rm`. |
+
+Safety behavior:
+
+- `merge` auto-commits dirty worktree changes before merging when possible.
+- `merge` refuses to continue if the project root is not on the detected main branch; check out the main branch and rerun it.
+- `clean` never deletes worktrees with pending file changes.
+- `remove` requires `--force` to discard unmerged or uncommitted work.
 
 ## Telegram Commands
 
@@ -294,6 +322,16 @@ echo "Build a CLI tool" | gsd headless new-milestone --context -
 **Exit codes:** `0` = complete, `1` = error or timeout, `2` = blocked.
 
 Any `/gsd` subcommand works as a positional argument — `gsd headless status`, `gsd headless doctor`, `gsd headless dispatch execute`, etc.
+
+### `gsd headless recover` (v2.79)
+
+Non-TTY equivalent of `/gsd recover` — resets the DB hierarchy plus persisted validation and quality-gate state, then reconstructs from rendered markdown. Designed for CI, cron, and any environment where the interactive recover prompt cannot run.
+
+```bash
+gsd headless recover
+```
+
+Exits non-zero if recovery fails. Pair with `gsd headless query` afterwards to verify the rebuilt state.
 
 ### `gsd headless query`
 

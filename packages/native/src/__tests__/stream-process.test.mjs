@@ -1,6 +1,10 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { processStreamChunk } from "../stream-process/index.ts";
+import { createRequire } from "node:module";
+import { processStreamChunk } from "@gsd/native/stream-process";
+
+const require_ = createRequire(import.meta.url);
+const { native } = require_("../../dist/native.js");
 
 describe("processStreamChunk", () => {
   test("processes a single chunk without state", () => {
@@ -30,5 +34,55 @@ describe("processStreamChunk", () => {
     assert.ok(Array.isArray(result.state.ansiPending), "ansiPending should be a plain array");
     assert.ok(!(result.state.utf8Pending instanceof Buffer), "utf8Pending should not be a Buffer");
     assert.ok(!(result.state.ansiPending instanceof Buffer), "ansiPending should not be a Buffer");
+  });
+
+  test("falls back when the native stream symbol is missing", () => {
+    const original = native.processStreamChunk;
+    native.processStreamChunk = undefined;
+    try {
+      const result = processStreamChunk(Buffer.from("\x1b[32mgreen\x1b[0m\n"));
+      assert.equal(result.text, "green\n");
+      assert.deepEqual(result.state, { utf8Pending: [], ansiPending: [] });
+    } finally {
+      native.processStreamChunk = original;
+    }
+  });
+
+  test("fallback carries split ANSI sequences across chunks", () => {
+    const original = native.processStreamChunk;
+    native.processStreamChunk = undefined;
+    try {
+      const first = processStreamChunk(Buffer.from("\x1b[31"));
+      assert.equal(first.text, "");
+      assert.ok(first.state.ansiPending.length > 0);
+
+      const second = processStreamChunk(
+        Buffer.from("mOK\x1b[0m\n"),
+        first.state,
+      );
+      assert.equal(second.text, "OK\n");
+      assert.deepEqual(second.state, { utf8Pending: [], ansiPending: [] });
+    } finally {
+      native.processStreamChunk = original;
+    }
+  });
+
+  test("fallback carries split UTF-8 sequences across chunks", () => {
+    const original = native.processStreamChunk;
+    native.processStreamChunk = undefined;
+    try {
+      const check = Buffer.from("✓");
+      const first = processStreamChunk(
+        Buffer.concat([Buffer.from("OK "), check.subarray(0, 1)]),
+      );
+      assert.equal(first.text, "OK ");
+      assert.ok(first.state.utf8Pending.length > 0);
+
+      const second = processStreamChunk(check.subarray(1), first.state);
+      assert.equal(second.text, "✓");
+      assert.deepEqual(second.state, { utf8Pending: [], ansiPending: [] });
+    } finally {
+      native.processStreamChunk = original;
+    }
   });
 });

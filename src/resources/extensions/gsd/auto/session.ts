@@ -21,6 +21,10 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import type { GitServiceImpl } from "../git-service.js";
 import type { CaptureEntry } from "../captures.js";
 import type { BudgetAlertLevel } from "../auto-budget.js";
+import type { AutoOrchestrationModule } from "./contracts.js";
+import { resolveWorktreeProjectRoot } from "../worktree-root.js";
+import { normalizeRealPath } from "../paths.js";
+import type { MilestoneScope } from "../workspace.js";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
@@ -75,9 +79,7 @@ export interface PreExecFailure {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-export const MAX_UNIT_DISPATCHES = 3;
 export const STUB_RECOVERY_THRESHOLD = 2;
-export const MAX_LIFETIME_DISPATCHES = 6;
 export const NEW_SESSION_TIMEOUT_MS = 120_000;
 
 // ─── AutoSession ─────────────────────────────────────────────────────────────
@@ -95,6 +97,23 @@ export class AutoSession {
   // ── Paths ────────────────────────────────────────────────────────────────
   basePath = "";
   originalBasePath = "";
+  // TODO(C8): remove basePath/originalBasePath once all readers use s.scope
+  scope: MilestoneScope | null = null;
+
+  // ── Coordination identity (Phase B — DB-backed coordination) ────────────
+  /**
+   * Worker registry ID set by registerAutoWorker() at session start. Used by
+   * heartbeatAutoWorker() each loop iteration and by recordDispatchClaim()
+   * to fence dispatch ledger writes against stale workers.
+   */
+  workerId: string | null = null;
+  /**
+   * Active milestone lease fencing token, set by claimMilestoneLease() inside
+   * WorktreeLifecycle.enterMilestone(). Threaded into recordDispatchClaim()
+   * as milestone_lease_token so out-of-band dispatches by a stale worker
+   * are detectable.
+   */
+  milestoneLeaseToken: number | null = null;
   previousProjectRootEnv: string | null = null;
   hadProjectRootEnv = false;
   projectRootEnvCaptured = false;
@@ -159,11 +178,20 @@ export class AutoSession {
    * stale context bleeding into unrelated slices.
    */
   lastPreExecFailure: PreExecFailure | null = null;
+  /**
+   * Tracks how many consecutive times each slice unit has failed pre-execution
+   * checks. Keyed by unitId (e.g. "M001/S01"). Used to break the infinite
+   * plan-slice → pre-exec fail → re-dispatch loop when the planner cannot fix
+   * the issues after MAX_PRE_EXEC_RETRIES re-attempts.
+   */
+  readonly preExecRetryCount: Map<string, number> = new Map();
 
   // ── Tool invocation errors (#2883) ──────────────────────────────────
   /** Set when a GSD tool execution ends with isError due to malformed/truncated
    *  JSON arguments. Checked by postUnitPreVerification to break retry loops. */
   lastToolInvocationError: string | null = null;
+  /** Agent-end messages from the just-finished unit, consumed during finalize. */
+  lastUnitAgentEndMessages: unknown[] | null = null;
   /** Set when turn-level git action fails during closeout. */
   lastGitActionFailure: string | null = null;
   /** Last turn-level git action status captured during finalize. */
@@ -178,6 +206,12 @@ export class AutoSession {
    *  stopAuto does not attempt the same merge a second time (#2645). */
   milestoneMergedInPhases = false;
 
+  // #4765 — slice-cadence collapse: main-branch SHAs at the moment each
+  // milestone's first slice merge began. Used by resquashMilestoneOnMain at
+  // milestone completion to collapse N slice commits into one. Cleared when
+  // the milestone finishes (or resquash runs).
+  milestoneStartShas: Map<string, string> = new Map();
+
   // ── Dispatch circuit breakers ──────────────────────────────────────
   rewriteAttemptCount = 0;
   /** Tracks consecutive bootstrap attempts that found phase === "complete".
@@ -189,6 +223,8 @@ export class AutoSession {
   lastPromptCharCount: number | undefined;
   lastBaselineCharCount: number | undefined;
   pendingQuickTasks: CaptureEntry[] = [];
+  /** Timestamp of the last LLM request dispatch (ms since epoch). Used for proactive rate limiting. */
+  lastRequestTimestamp = 0;
 
   // ── Safety harness ───────────────────────────────────────────────────────
   /** SHA of the pre-unit git checkpoint ref. Cleared on success or rollback. */
@@ -200,6 +236,9 @@ export class AutoSession {
   // ── Remote command polling ───────────────────────────────────────────────
   /** Cleanup function returned by startCommandPolling(); null when not running. */
   commandPollingCleanup: (() => void) | null = null;
+
+  // ── Orchestration seam ───────────────────────────────────────────────────
+  orchestration: AutoOrchestrationModule | null = null;
 
   // ── Loop promise state ──────────────────────────────────────────────────
   // Per-unit resolve function and session-switch guard live at module level
@@ -220,12 +259,25 @@ export class AutoSession {
   }
 
   get lockBasePath(): string {
-    // Prefer originalBasePath (project root); fall back to basePath.
-    // Strip /.gsd/worktrees/ suffix if basePath is itself a worktree path
-    // to avoid reading/writing the lock inside the worktree (#3729).
-    const resolved = this.originalBasePath || this.basePath;
-    const markerIdx = resolved.indexOf("/.gsd/worktrees/");
-    return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
+    return resolveWorktreeProjectRoot(this.basePath, this.originalBasePath);
+  }
+
+  /**
+   * Canonical project root for state-derivation reads AND writer paths.
+   *
+   * Prefers the realpath-normalized projectRoot from the MilestoneScope
+   * (introduced by PR #5236), falling back to resolveWorktreeProjectRoot
+   * during early lifecycle / engine-bypass paths where scope may be null.
+   *
+   * Always realpath-normalized so cache keys (e.g. deriveState's _stateCache)
+   * cannot drift across worktree↔project-root path-string variants for the
+   * same filesystem location.
+   */
+  get canonicalProjectRoot(): string {
+    const root =
+      this.scope?.workspace.projectRoot
+        ?? resolveWorktreeProjectRoot(this.basePath, this.originalBasePath);
+    return normalizeRealPath(root);
   }
 
   reset(): void {
@@ -243,6 +295,9 @@ export class AutoSession {
     // Paths
     this.basePath = "";
     this.originalBasePath = "";
+    this.scope = null;
+    this.workerId = null;
+    this.milestoneLeaseToken = null;
     this.previousProjectRootEnv = null;
     this.hadProjectRootEnv = false;
     this.projectRootEnvCaptured = false;
@@ -290,15 +345,19 @@ export class AutoSession {
     this.lastPromptCharCount = undefined;
     this.lastBaselineCharCount = undefined;
     this.pendingQuickTasks = [];
+    this.lastRequestTimestamp = 0;
     this.sidecarQueue = [];
     this.rewriteAttemptCount = 0;
     this.consecutiveCompleteBootstraps = 0;
     this.lastPreExecFailure = null;
+    this.preExecRetryCount.clear();
     this.lastToolInvocationError = null;
+    this.lastUnitAgentEndMessages = null;
     this.lastGitActionFailure = null;
     this.lastGitActionStatus = null;
     this.isolationDegraded = false;
     this.milestoneMergedInPhases = false;
+    this.milestoneStartShas = new Map();
     this.checkpointSha = null;
 
     // Signal handler
@@ -307,10 +366,14 @@ export class AutoSession {
     // Remote command polling — cleanup must be called before reset (auto.ts stopAuto)
     this.commandPollingCleanup = null;
 
+    // Orchestration seam
+    this.orchestration = null;
+
     // Loop promise state lives in auto-loop.ts module scope
   }
 
   toJSON(): Record<string, unknown> {
+    const orchestrationStatus = this.orchestration?.getStatus();
     return {
       active: this.active,
       paused: this.paused,
@@ -320,6 +383,9 @@ export class AutoSession {
       activeRunDir: this.activeRunDir,
       currentMilestoneId: this.currentMilestoneId,
       currentUnit: this.currentUnit,
+      orchestrationPhase: orchestrationStatus?.phase,
+      orchestrationTransitionCount: orchestrationStatus?.transitionCount,
+      orchestrationLastTransitionAt: orchestrationStatus?.lastTransitionAt,
       unitDispatchCount: Object.fromEntries(this.unitDispatchCount),
     };
   }

@@ -8,7 +8,7 @@ The built-in diagnostic tool validates `.gsd/` integrity:
 /gsd doctor
 ```
 
-It checks file structure, roadmap ↔ slice ↔ task consistency, completion state, git health, stale locks, and orphaned records.
+It checks file structure, roadmap ↔ slice ↔ task consistency, completion state, git health, stale locks, orphaned records, and disk-only milestone stubs.
 
 ## Common Issues
 
@@ -82,6 +82,24 @@ Worktree merge fails on `.gsd/` files.
 
 **Fix:** `.gsd/` conflicts are auto-resolved. Code conflicts get an AI fix attempt; if that fails, resolve manually.
 
+### Work stranded in a worktree after an interrupted session
+
+Auto mode was paused, stopped, or crashed mid-milestone, and the work is still on the `milestone/<MID>` branch in `.gsd/worktrees/<MID>/` — never merged back to main. Next session reports the milestone as incomplete or behaving inconsistently.
+
+**Fix:** As of GSD 2.78, `/gsd auto` bootstrap automatically detects this condition and surfaces a warning naming the branch, commit count, and worktree location. Run `/gsd auto` to re-enter the worktree and resume; or merge `milestone/<MID>` into main manually if abandoning.
+
+**Diagnose:** Run `/gsd forensics` and look at the **Worktree Telemetry** section:
+- `Orphans detected > 0` with reason `in-progress-unmerged` confirms the condition
+- `Unmerged exits > 0` on the producer side confirms which exit type caused it
+
+**Prevent recurrence:** If your milestones are large or sessions are frequently interrupted, consider setting `git.collapse_cadence: "slice"` in preferences — validated slices merge to main immediately, shrinking the orphan window from milestone-size to slice-size. See [Git & Worktrees](../configuration/git-settings.md#collapse-cadence).
+
+### `orphan_milestone_dir` doctor warning
+
+`/gsd doctor` can report `orphan_milestone_dir` when `.gsd/milestones/<MID>/` exists on disk but has no DB row, no matching `.gsd/worktrees/<MID>/` worktree, and no milestone content files. This is a disk-only stub, not stranded work, and it can skew future milestone ID generation.
+
+**Fix:** Run `/gsd doctor fix` to remove the orphan stub directory automatically. The fix only removes these empty disk-only milestone stubs; populated milestone directories and in-flight worktree-only milestones are preserved.
+
 ### Notifications not appearing on macOS
 
 **Fix:** Install `terminal-notifier`:
@@ -123,13 +141,23 @@ Then `/gsd auto` to restart from current state.
 rm .gsd/routing-history.json
 ```
 
-### Full state rebuild
+### Refresh rendered state
 
 ```
 /gsd doctor
 ```
 
-Rebuilds `STATE.md` from plan and roadmap files and fixes inconsistencies.
+Checks the authoritative database, refreshes `STATE.md` from derived database state, and fixes projection or runtime-file inconsistencies.
+
+### Recover database hierarchy from markdown
+
+Use this only when the database is missing, damaged, or known to be stale but the rendered milestone, slice, and task markdown on disk is the best available source:
+
+```
+/gsd recover
+```
+
+`/gsd recover` clears and reconstructs the database hierarchy tables from markdown, then derives state again to verify the result. Normal runtime does not silently import markdown projections, and worktree markdown is not synced back as authoritative state.
 
 ## Getting Help
 

@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Handles operational /gsd subcommands.
 import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 
 import { enableDebug } from "../../debug-logger.js";
@@ -15,7 +17,7 @@ import { handleRemote } from "../../../remote-questions/mod.js";
 import { handleShip } from "../../commands-ship.js";
 import { handleSessionReport } from "../../commands-session-report.js";
 import { handlePrBranch } from "../../commands-pr-branch.js";
-import { projectRoot } from "../context.js";
+import { currentDirectoryRoot, projectRoot } from "../context.js";
 
 export async function handleOpsCommand(trimmed: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<boolean> {
   if (trimmed === "init") {
@@ -117,7 +119,7 @@ export async function handleOpsCommand(trimmed: string, ctx: ExtensionCommandCon
     return true;
   }
   if (trimmed === "triage") {
-    await handleTriage(ctx, pi, process.cwd());
+    await handleTriage(ctx, pi, currentDirectoryRoot());
     return true;
   }
   if (trimmed === "config") {
@@ -246,6 +248,11 @@ Examples:
     await handleAddTests(trimmed.replace(/^add-tests\s*/, "").trim(), ctx, pi);
     return true;
   }
+  if (trimmed === "eval-review" || trimmed.startsWith("eval-review ")) {
+    const { handleEvalReview } = await import("../../commands-eval-review.js");
+    await handleEvalReview(trimmed.replace(/^eval-review\s*/, "").trim(), ctx, pi);
+    return true;
+  }
   if (trimmed === "extract-learnings" || trimmed.startsWith("extract-learnings ")) {
     const { handleExtractLearnings } = await import("../../commands-extract-learnings.js");
     await handleExtractLearnings(trimmed.replace(/^extract-learnings\s*/, "").trim(), ctx, pi);
@@ -260,6 +267,16 @@ Examples:
     const { handleScan } = await import("../../commands-scan.js");
     // \s* (not \s+) is intentional: handles both /gsd scan (no args) and /gsd scan --focus X
     await handleScan(trimmed.replace(/^scan\s*/, "").trim(), ctx, pi);
+    return true;
+  }
+  if (
+    trimmed === "worktree" ||
+    trimmed.startsWith("worktree ") ||
+    trimmed === "wt" ||
+    trimmed.startsWith("wt ")
+  ) {
+    const { handleWorktree } = await import("../../commands-worktree.js");
+    await handleWorktree(trimmed.replace(/^(worktree|wt)\s*/, "").trim(), ctx);
     return true;
   }
   return false;

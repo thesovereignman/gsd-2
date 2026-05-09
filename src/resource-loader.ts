@@ -1,4 +1,4 @@
-import { DefaultResourceLoader, sortExtensionPaths } from '@gsd/pi-coding-agent'
+import type { DefaultResourceLoader as DefaultResourceLoaderType } from '@gsd/pi-coding-agent'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -7,6 +7,15 @@ import { fileURLToPath } from 'node:url'
 import { compareSemver } from './update-check.js'
 import { discoverExtensionEntryPaths } from './extension-discovery.js'
 import { loadRegistry, readManifestFromEntryPath, isExtensionEnabled, ensureRegistryEntries } from './extension-registry.js'
+import { resolveBundledResourcesDirFromPackageRoot } from './bundled-resource-path.js'
+
+type PiCodingAgentModule = typeof import('@gsd/pi-coding-agent')
+
+let piCodingAgentModulePromise: Promise<PiCodingAgentModule> | undefined
+
+function loadPiCodingAgentModule(): Promise<PiCodingAgentModule> {
+  return (piCodingAgentModulePromise ??= import('@gsd/pi-coding-agent'))
+}
 
 // Resolve resources directory — prefer dist/resources/ (stable, set at build time)
 // over src/resources/ (live working tree, changes with git branch).
@@ -17,16 +26,10 @@ import { loadRegistry, readManifestFromEntryPath, isExtensionEnabled, ensureRegi
 // dist/resources/ is populated by the build step (`npm run copy-resources`) and
 // reflects the built state, not the currently checked-out branch.
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const distResources = join(packageRoot, 'dist', 'resources')
-const srcResources = join(packageRoot, 'src', 'resources')
-// Use dist/resources only if it has the full expected structure.
-// A partial build (tsc without copy-resources) creates dist/resources/extensions/
-// but not agents/ or skills/, causing initResources to sync from an incomplete source.
-const resourcesDir = (existsSync(distResources) && existsSync(join(distResources, 'agents')))
-  ? distResources
-  : srcResources
+const resourcesDir = resolveBundledResourcesDirFromPackageRoot(packageRoot)
 const bundledExtensionsDir = join(resourcesDir, 'extensions')
 const resourceVersionManifestName = 'managed-resources.json'
+const resourceFingerprintFileName = '.managed-resources-content-hash'
 
 interface ManagedResourceManifest {
   gsdVersion: string
@@ -53,6 +56,10 @@ export { discoverExtensionEntryPaths } from './extension-discovery.js'
 export function getExtensionKey(entryPath: string, extensionsDir: string): string {
   const relPath = relative(extensionsDir, entryPath)
   return relPath.split(/[\\/]/)[0].replace(/\.(?:ts|js)$/, '')
+}
+
+function stripSemverBuildMetadata(version: string): string {
+  return version.trim().replace(/^v/, '').split(/[+-]/, 1)[0] || '0.0.0'
 }
 
 function getManagedResourceManifestPath(agentDir: string): string {
@@ -102,7 +109,7 @@ function writeManagedResourceManifest(agentDir: string): void {
   const manifest: ManagedResourceManifest = {
     gsdVersion: getBundledGsdVersion(),
     syncedAt: Date.now(),
-    contentHash: computeResourceFingerprint(),
+    contentHash: getCurrentResourceFingerprint(),
     installedExtensionRootFiles,
     installedExtensionDirs,
   }
@@ -127,31 +134,62 @@ function readManagedResourceManifest(agentDir: string): ManagedResourceManifest 
 }
 
 /**
- * Computes a lightweight content fingerprint of the bundled resources directory.
+ * Computes a content fingerprint of a resources directory (defaults to the
+ * bundled resourcesDir).
  *
- * Walks all files under resourcesDir and hashes their relative paths + sizes.
- * This catches same-version content changes (npm link dev workflow, hotfixes
- * within a release) without the cost of reading every file's contents.
+ * Walks all files under `rootDir` and hashes `${relativePath}:${sha256(contents)}`
+ * for each one. Using the file *contents* — not size — is what distinguishes
+ * this from the earlier implementation and closes #4787: a same-size edit
+ * (e.g. swapping one word for another word of the same byte length) produces
+ * a different file hash, bumps the aggregate fingerprint, and therefore
+ * triggers a full resync in `initResources`. The old path+size approach
+ * silently cached stale prompts across upgrades.
  *
- * ~1ms for a typical resources tree (~100 files) — just stat calls, no reads.
+ * Cost is ~1-2ms for a typical resources tree (~100 small .md files) —
+ * still negligible at startup. Files are streamed via `readFileSync` but
+ * bundled prompts are tiny so this is fine.
+ *
+ * Exported for unit tests and for callers that want to check a different
+ * directory (e.g. pre-install verification).
  */
-function computeResourceFingerprint(): string {
+export function computeResourceFingerprint(rootDir: string = resourcesDir): string {
   const entries: string[] = []
-  collectFileEntries(resourcesDir, resourcesDir, entries)
+  collectFileEntries(rootDir, rootDir, entries)
   entries.sort()
   return createHash('sha256').update(entries.join('\n')).digest('hex').slice(0, 16)
+}
+
+function getCurrentResourceFingerprint(): string {
+  try {
+    const precomputed = readFileSync(join(resourcesDir, resourceFingerprintFileName), 'utf-8').trim()
+    if (/^[a-f0-9]{16}$/i.test(precomputed)) {
+      return precomputed
+    }
+  } catch {
+    // Source-tree and partial-build workflows may not have a precomputed hash.
+  }
+  return computeResourceFingerprint()
 }
 
 function collectFileEntries(dir: string, root: string, out: string[]): void {
   if (!existsSync(dir)) return
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === resourceFingerprintFileName) continue
     const fullPath = join(dir, entry.name)
     if (entry.isDirectory()) {
       collectFileEntries(fullPath, root, out)
     } else {
       const rel = relative(root, fullPath)
-      const size = statSync(fullPath).size
-      out.push(`${rel}:${size}`)
+      // Hash the file contents — see function doc for #4787 rationale.
+      let contentHash: string
+      try {
+        contentHash = createHash('sha256').update(readFileSync(fullPath)).digest('hex')
+      } catch {
+        // Unreadable file — fall back to a stable marker so the entry still
+        // contributes to the aggregate hash and future reads will re-hash.
+        contentHash = 'unreadable'
+      }
+      out.push(`${rel}:${contentHash}`)
     }
   }
 }
@@ -162,7 +200,12 @@ export function getNewerManagedResourceVersion(agentDir: string, currentVersion:
   if (!managedVersion) {
     return null
   }
-  return compareSemver(managedVersion, currentVersion) > 0 ? managedVersion : null
+  // Managed resources stamped from the same release line should remain usable
+  // against local dev binaries like 2.78.1-dev.<sha>.
+  return compareSemver(
+    stripSemverBuildMetadata(managedVersion),
+    stripSemverBuildMetadata(currentVersion),
+  ) > 0 ? managedVersion : null
 }
 
 /**
@@ -219,7 +262,7 @@ function makeTreeWritable(dirPath: string): void {
  * 3. Copies source into destination.
  * 4. Makes the result writable for the next upgrade cycle.
  */
-function syncResourceDir(srcDir: string, destDir: string): void {
+export function syncResourceDir(srcDir: string, destDir: string): void {
   makeTreeWritable(destDir)
   if (existsSync(srcDir)) {
     pruneStaleSiblingFiles(srcDir, destDir)
@@ -319,7 +362,7 @@ function ensureNodeModulesSymlink(agentDir: string): void {
 }
 
 /** Check if any @gsd* scopes exist in internal but not in hoisted node_modules */
-function hasMissingWorkspaceScopes(hoisted: string, internal: string): boolean {
+export function hasMissingWorkspaceScopes(hoisted: string, internal: string): boolean {
   if (!existsSync(internal)) return false
   try {
     for (const entry of readdirSync(internal, { withFileTypes: true })) {
@@ -360,7 +403,7 @@ function reconcileSymlink(link: string, target: string): void {
  * hoisted root (external deps) and internal root (@gsd/* workspace packages).
  * Used for pnpm global installs where @gsd/* isn't hoisted.
  */
-function reconcileMergedNodeModules(
+export function reconcileMergedNodeModules(
   agentNodeModules: string,
   hoisted: string,
   internal: string,
@@ -421,7 +464,7 @@ function reconcileMergedNodeModules(
 }
 
 /** Build a cache fingerprint from packageRoot + sorted entry names of both directories */
-function mergedFingerprint(hoisted: string, internal: string): string {
+export function mergedFingerprint(hoisted: string, internal: string): string {
   try {
     const h = readdirSync(hoisted).sort().join(',')
     const i = readdirSync(internal).sort().join(',')
@@ -550,7 +593,7 @@ export function initResources(agentDir: string, skillsDir: string = join(homedir
   // hotfixes within a release). The content hash catches those at ~1ms cost.
   if (manifest && manifest.gsdVersion === currentVersion) {
     // Version matches — check content fingerprint for same-version staleness.
-    const currentHash = computeResourceFingerprint()
+    const currentHash = getCurrentResourceFingerprint()
     const hasStaleExtensionFiles = hasStaleCompiledExtensionSiblings(extensionsDir, bundledExtensionsDir)
     if (manifest.contentHash && manifest.contentHash === currentHash && !hasStaleExtensionFiles) {
       return
@@ -683,28 +726,40 @@ function migrateSkillsToEcosystemDir(agentDir: string): void {
 
 export function hasStaleCompiledExtensionSiblings(extensionsDir: string, sourceDir: string = bundledExtensionsDir): boolean {
   if (!existsSync(extensionsDir)) return false
-  const sourceFiles = existsSync(sourceDir)
-    ? new Set(
-        readdirSync(sourceDir, { withFileTypes: true })
-          .filter((entry) => entry.isFile())
-          .map((entry) => entry.name),
-      )
-    : new Set<string>()
-  for (const entry of readdirSync(extensionsDir, { withFileTypes: true })) {
-    if (!entry.isFile()) continue
-    if (!entry.name.endsWith('.ts') && !entry.name.endsWith('.js')) continue
+  const sourceFiles = collectRelativeFiles(sourceDir)
+  const installedFiles = collectRelativeFiles(extensionsDir)
 
-    const siblingName = entry.name.endsWith('.ts')
-      ? entry.name.replace(/\.ts$/, '.js')
-      : entry.name.replace(/\.js$/, '.ts')
+  for (const relPath of installedFiles) {
+    if (!relPath.endsWith('.ts') && !relPath.endsWith('.js')) continue
+    if (sourceFiles.has(relPath)) continue
 
-    if (!existsSync(join(extensionsDir, siblingName))) continue
-    if (sourceFiles.has(entry.name) && sourceFiles.has(siblingName)) continue
-    if (sourceFiles.has(entry.name) || sourceFiles.has(siblingName)) {
-      return true
+    const bundledSibling = relPath.endsWith('.ts')
+      ? relPath.replace(/\.ts$/, '.js')
+      : relPath.replace(/\.js$/, '.ts')
+
+    if (sourceFiles.has(bundledSibling)) return true
+  }
+
+  return false
+}
+
+function collectRelativeFiles(rootDir: string): Set<string> {
+  const files = new Set<string>()
+  if (!existsSync(rootDir)) return files
+
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        visit(entryPath)
+        continue
+      }
+      files.add(relative(rootDir, entryPath).replaceAll('\\', '/'))
     }
   }
-  return false
+
+  visit(rootDir)
+  return files
 }
 
 /**
@@ -724,7 +779,15 @@ function getBundledExtensionKeys(): Set<string> {
   return _bundledExtensionKeys
 }
 
-export function buildResourceLoader(agentDir: string): DefaultResourceLoader {
+interface BuildResourceLoaderOptions {
+  additionalExtensionPaths?: string[]
+}
+
+export async function buildResourceLoader(
+  agentDir: string,
+  options: BuildResourceLoaderOptions = {},
+): Promise<DefaultResourceLoaderType> {
+  const { DefaultResourceLoader, sortExtensionPaths } = await loadPiCodingAgentModule()
   const registry = loadRegistry()
   const piAgentDir = join(homedir(), '.pi', 'agent')
   const piExtensionsDir = join(piAgentDir, 'extensions')
@@ -736,10 +799,14 @@ export function buildResourceLoader(agentDir: string): DefaultResourceLoader {
       if (!manifest) return true
       return isExtensionEnabled(registry, manifest.id)
     })
+  const additionalExtensionPaths = [
+    ...piExtensionPaths,
+    ...(options.additionalExtensionPaths ?? []),
+  ]
 
   return new DefaultResourceLoader({
     agentDir,
-    additionalExtensionPaths: piExtensionPaths,
+    additionalExtensionPaths,
     bundledExtensionKeys: bundledKeys,
     extensionPathsTransform: (paths: string[]) => {
       // 1. Filter community extensions through the GSD registry

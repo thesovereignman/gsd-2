@@ -1,9 +1,8 @@
 // @gsd-build/mcp-server — Tests for env-writer utilities
-// Copyright (c) 2026 Jeremy McSpadden <jeremy@fluxlabs.net>
 
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,8 +11,10 @@ import {
   detectDestination,
   writeEnvKey,
   applySecrets,
+  isSecuritySensitiveEnvKey,
   isSafeEnvVarKey,
   isSupportedDeploymentEnvironment,
+  resolveProjectEnvFilePath,
   shellEscapeSingle,
 } from './env-writer.js';
 
@@ -181,6 +182,83 @@ describe('writeEnvKey', () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it('does not follow symlinked env files when writing', async () => {
+    const tmp = makeTempDir('write');
+    const outside = makeTempDir('write-outside');
+    try {
+      const outsideEnv = join(outside, '.env');
+      writeFileSync(outsideEnv, 'SECRET=outside\n');
+      symlinkSync(outsideEnv, join(tmp, '.env'));
+
+      await assert.rejects(
+        () => writeEnvKey(join(tmp, '.env'), 'SECRET', 'inside'),
+        /ELOOP|symbolic link|symlink/i,
+      );
+      assert.equal(readFileSync(outsideEnv, 'utf8'), 'SECRET=outside\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveProjectEnvFilePath
+// ---------------------------------------------------------------------------
+
+describe('resolveProjectEnvFilePath', () => {
+  it('allows .env under the project root', () => {
+    const tmp = makeTempDir('env-path');
+    try {
+      assert.equal(resolveProjectEnvFilePath(tmp, '.env'), join(realpathSync.native(tmp), '.env'));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects envFilePath outside the project root', () => {
+    const tmp = makeTempDir('env-path');
+    try {
+      assert.throws(
+        () => resolveProjectEnvFilePath(tmp, '../outside.env'),
+        /inside the project directory/,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlinked parent directories that escape the project root', () => {
+    const tmp = makeTempDir('env-path');
+    const outside = makeTempDir('env-path-outside');
+    try {
+      symlinkSync(outside, join(tmp, 'linked-outside'), 'dir');
+      assert.throws(
+        () => resolveProjectEnvFilePath(tmp, 'linked-outside/.env'),
+        /inside the project directory/,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects existing env files that are symlinks outside the project root', () => {
+    const tmp = makeTempDir('env-path');
+    const outside = makeTempDir('env-path-outside');
+    try {
+      writeFileSync(join(outside, '.env'), 'SECRET=outside\n');
+      symlinkSync(join(outside, '.env'), join(tmp, '.env'));
+      assert.throws(
+        () => resolveProjectEnvFilePath(tmp, '.env'),
+        /inside the project directory/,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -217,6 +295,41 @@ describe('applySecrets', () => {
     }
   });
 
+  it('rejects invalid dotenv keys before writing or hydrating', async () => {
+    const tmp = makeTempDir('apply-invalid');
+    const envPath = join(tmp, '.env');
+    try {
+      const { applied, errors } = await applySecrets(
+        [{ key: 'BAD-KEY', value: 'val-a' }],
+        'dotenv',
+        { envFilePath: envPath },
+      );
+      assert.deepStrictEqual(applied, []);
+      assert.deepStrictEqual(errors, ['BAD-KEY: invalid environment variable name']);
+      assert.throws(() => readFileSync(envPath, 'utf8'), /ENOENT/);
+      assert.equal(process.env['BAD-KEY'], undefined);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects security-sensitive dotenv keys case-insensitively', async () => {
+    const tmp = makeTempDir('apply-sensitive');
+    const envPath = join(tmp, '.env');
+    try {
+      const { applied, errors } = await applySecrets(
+        [{ key: 'path', value: 'malicious-bin' }],
+        'dotenv',
+        { envFilePath: envPath },
+      );
+      assert.deepStrictEqual(applied, []);
+      assert.deepStrictEqual(errors, ['path: refusing to set MCP server runtime variable via secure_env_collect']);
+      assert.throws(() => readFileSync(envPath, 'utf8'), /ENOENT/);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('returns errors for invalid vercel environment', async () => {
     const tmp = makeTempDir('apply');
     try {
@@ -231,6 +344,38 @@ describe('applySecrets', () => {
       );
       assert.deepStrictEqual(applied, []);
       assert.ok(errors[0]?.includes('unsupported'));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('passes remote destination secrets on stdin instead of process arguments', async () => {
+    const tmp = makeTempDir('apply-remote-stdin');
+    const calls: Array<{ cmd: string; args: string[]; opts?: { stdin?: string } }> = [];
+    try {
+      const { applied, errors } = await applySecrets(
+        [{ key: 'REMOTE_SECRET', value: 'super-secret-value' }],
+        'vercel',
+        {
+          envFilePath: join(tmp, '.env'),
+          environment: 'preview',
+          execFn: async (cmd, args, opts) => {
+            calls.push({ cmd, args, opts });
+            return { code: 0, stderr: '' };
+          },
+        },
+      );
+
+      assert.deepStrictEqual(applied, ['REMOTE_SECRET']);
+      assert.deepStrictEqual(errors, []);
+      assert.deepStrictEqual(calls, [
+        {
+          cmd: 'vercel',
+          args: ['env', 'add', 'REMOTE_SECRET', 'preview'],
+          opts: { stdin: 'super-secret-value' },
+        },
+      ]);
+      assert.ok(!calls[0].args.some((arg) => arg.includes('super-secret-value')));
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -253,6 +398,14 @@ describe('isSafeEnvVarKey', () => {
     assert.ok(!isSafeEnvVarKey('has-dash'));
     assert.ok(!isSafeEnvVarKey('has space'));
     assert.ok(!isSafeEnvVarKey(''));
+  });
+});
+
+describe('isSecuritySensitiveEnvKey', () => {
+  it('matches sensitive keys case-insensitively', () => {
+    assert.ok(isSecuritySensitiveEnvKey('PATH'));
+    assert.ok(isSecuritySensitiveEnvKey('path'));
+    assert.ok(isSecuritySensitiveEnvKey('Node_Options'));
   });
 });
 
